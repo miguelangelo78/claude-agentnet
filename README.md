@@ -125,6 +125,60 @@ for woken agents to read).
 - **`$AGENTNET_WAKE_MODEL`** (optional) sets the model for woken agents, e.g.
   `export AGENTNET_WAKE_MODEL=sonnet` for cheaper/faster wakes.
 
+## How this relates to Claude Code agent teams
+
+Claude Code's built-in [agent teams](https://code.claude.com/docs/en/agent-teams)
+overlap with agentnet — both let independent Claude instances message each other — but
+they're built for different shapes, and they **compose** rather than compete:
+
+- **Agent teams** is *intra-project*: a **lead** spawns fresh **teammates** that work
+  the lead's codebase, coordinated by a shared task list, then cleans the team up. Use
+  it for parallel work *inside one project* (review a PR from N angles, refactor
+  modules in parallel, debug with competing hypotheses). It's the official, integrated
+  path and owns that case.
+- **agentnet** is *inter-project*: a persistent bus between **already-running,
+  independent agents that each own a different repo** and carry their own long-lived
+  context (history + memory). Use it to *consult a standing specialist in another
+  project*, reach an agent that isn't running (`wake`), or send durable async messages
+  — with no lead and no team setup.
+
+|              | Agent teams (official)               | agentnet                                  |
+| ------------ | ------------------------------------ | ----------------------------------------- |
+| Scope        | One project (lead's codebase)        | Across different projects/repos           |
+| The agents   | Fresh teammates spawned for the team | Pre-existing, independent standing agents |
+| Context      | Loads the project's CLAUDE.md fresh  | Each agent's own live history + memory    |
+| Coordination | Lead + shared task list              | Just messaging — no lead, no task list    |
+| Lifecycle    | Ephemeral team (created → cleaned up) | Persistent bus; agents come and go        |
+| Offline      | Teammates are ephemeral              | Durable messages + wake a dormant agent   |
+
+### Composing them: teams talking to teams
+
+The two layers stack cleanly — agentnet sits *above* agent teams:
+
+- **Within a project**, a lead runs an agent **team**.
+- **Across projects**, the **leads** talk to each other over **agentnet**.
+
+So "teams talking to teams" works by making **the lead the gateway** — managers
+talking to managers, each running their own team beneath them.
+
+The rule that keeps it clean: **one agentnet identity per team — register only the
+lead.** agentnet's identity is the directory basename, so a lead and its teammates
+(same project dir) would otherwise all collide on one name. Keep teammates internal
+(they coordinate via the team's own mailbox + task list); the lead relays cross-project
+answers down to them. To expose a teammate cross-project directly, give it a distinct
+`$AGENTNET_NAME` — but routing through the lead avoids a teammate going around its own
+lead.
+
+Rough edges worth knowing:
+
+- A lead leading a team *and* watching the bus juggles two coordination channels — for
+  a busy lead, consider dedicating one teammate as the "agentnet liaison."
+- The `wake` → spin-up-a-team path is untested: `wake` launches a headless
+  `claude -p`, and whether it can usefully form an in-process team from there is
+  unproven. Async messaging to a *running* lead is the solid path.
+- Token cost scales with every live instance (M teams × N teammates).
+- Both layers coordinate through local state, so this is same-host orchestration today.
+
 ## Tests
 
 ```
