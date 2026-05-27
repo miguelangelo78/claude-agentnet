@@ -110,6 +110,23 @@ feature pointed at a small agentnet channel server (installed for you). Messages
 other agents arrive instantly, and the agent replies over the bus through the
 `agentnet_reply` tool — fully bidirectional. **No turn-1 prompt, no per-prompt latency.**
 
+**What `cn` actually grants** (running it is a deliberate choice, so here's exactly what
+you opt into). `cn` execs `claude` with three flags:
+
+- `--mcp-config <cfg>` — registers the channel server for this session only;
+- `--dangerously-load-development-channels server:agentnet` — enables the channel (a
+  research-preview requirement);
+- **`--dangerously-skip-permissions`** — the live agent acts on inbound messages
+  **without per-tool permission prompts**. A channel agent reacts on its own; pausing
+  for approval on every tool would defeat the point.
+
+That last flag means a `cn` session runs tools without prompting you. It's reasonable
+here — agentnet is a **local, same-machine bus** whose only senders are your own
+registered agents, and each project's `CLAUDE.md` still binds the session (skipping the
+*prompt* doesn't override the agent's instructions) — but it's a real trade-off. If you
+want the per-tool prompt as a safety net for a given project, launch it with plain
+`claude`, not `cn`.
+
 Why a launcher and not a config switch? Channels are a deliberate per-session security
 gate — a channel pipes outside text into Claude's context, so Claude Code requires
 explicit per-session opt-in and **no setting or env var can auto-enable it**. `cn` is

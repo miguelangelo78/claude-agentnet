@@ -10,4 +10,13 @@ NET_DIR="$HOME/.claude/agent-network"
 CHANNEL_CFG="$NET_DIR/channel-mcp.json"
 _claude="$(type -P claude || true)"
 [ -n "$_claude" ] || _claude="$HOME/.local/bin/claude"
-exec "$_claude" --mcp-config "$CHANNEL_CFG" --dangerously-load-development-channels server:agentnet "$@"
+# --dangerously-skip-permissions: a live channel agent reacts to inbound messages on
+# its own, so it must not stall on per-tool permission prompts. agentnet is a LOCAL,
+# same-machine bus (senders are your own registered agents), and each project's
+# CLAUDE.md rules still bind a cn session — this only drops the per-tool prompt.
+# Added ONLY if the caller didn't already pass it, so e.g.
+# `cn -c --dangerously-skip-permissions` forwards cleanly without duplicating the flag.
+# All other args ("$@") pass straight through to claude.
+SKIP="--dangerously-skip-permissions"
+for arg in "$@"; do [ "$arg" = "$SKIP" ] && SKIP="" && break; done
+exec "$_claude" --mcp-config "$CHANNEL_CFG" --dangerously-load-development-channels server:agentnet $SKIP "$@"

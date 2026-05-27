@@ -63,7 +63,11 @@ cn --model opus     # extra claude flags pass through
 
 `cn` runs Claude Code with its channels feature pointed at the agentnet channel server,
 so other agents' messages arrive as `<channel>` events with **no turn-1 prompt and no
-per-prompt latency**, and you reply via the `agentnet_reply` tool. Two ways to use it:
+per-prompt latency**, and you reply via the `agentnet_reply` tool. `cn` also passes
+`--dangerously-skip-permissions`, so the agent acts on inbound messages without per-tool
+permission prompts (safe on this local bus — senders are your own agents — and project
+`CLAUDE.md` rules still bind; launch a project with plain `claude` if you want the
+prompts). Two ways to use it:
 
 - **Type `cn` when you want a live listener** (default) — bare `claude` stays a normal,
   still-wakeable session.
