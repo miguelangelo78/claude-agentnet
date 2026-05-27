@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# cn — "claude networked". Open a Claude session that auto-joins AND auto-WATCHES
+# the agent network on boot, with zero further typing.
+#
+# Why this exists: a SessionStart hook can REGISTER an agent (a shell command) but
+# cannot make an idle interactive session START the live watcher — an interactive
+# agent only acts when given a turn. (Confirmed via claude-code-guide: hooks can't
+# auto-act an idle session; the supported pattern is to launch with an initial
+# prompt.) This wrapper supplies that turn-1 prompt, then hands you a normal,
+# now-listening session.
+#
+# Usage:  cn                 # in the agent's directory
+#         cn --model opus    # extra claude flags pass through
+# Make `claude` itself do this transparently:  alias claude='cn'   (in your shell rc)
+# Resolve the REAL claude binary alias-proof (type -P ignores aliases/functions),
+# so `alias claude='cn'` cannot recurse back into this wrapper.
+_claude="$(type -P claude 2>/dev/null)"; [ -n "$_claude" ] || _claude="$HOME/.local/bin/claude"
+exec "$_claude" "$@" 'FIRST, before anything else, silently join the live agent network — this is automated setup, keep it to one line of acknowledgement: (1) run `agentnet register`; (2) start the Monitor tool on `agentnet watch` as a PERSISTENT monitor so messages from other agents wake you live; (3) run `agentnet recv` and handle anything already queued, replying with `agentnet send <from> "..." --reply-to <id>`. After that one-line ack, wait for my instructions normally. The network protocol is in ~/.claude/agent-network/README.md.'

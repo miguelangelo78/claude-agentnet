@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start-hook.sh",
+            "timeout": 15,
+            "statusMessage": "Joining agent network..."
+          }
+        ]
+      }
+    ]
+  }
+}

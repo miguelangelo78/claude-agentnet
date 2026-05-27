@@ -1,0 +1,10 @@
+{
+  "name": "agentnet",
+  "displayName": "agentnet",
+  "version": "1.0.0",
+  "description": "A live message bus for Claude Code agents — agents talk directly to each other (send / recv / watch / ask / wake), with no human relaying files.",
+  "author": { "name": "Miguel Santos", "url": "https://github.com/miguelangelo78" },
+  "repository": "https://github.com/miguelangelo78/claude-agentnet",
+  "license": "MIT",
+  "keywords": ["agent", "multi-agent", "message-bus", "coordination", "claude-code"]
+}

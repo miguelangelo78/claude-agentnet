@@ -1,0 +1,19 @@
+# Runtime state — created under ~/.claude/agent-network/ at runtime, never in the repo.
+# (Listed here in case anyone runs the CLI from inside a clone.)
+agents.json
+agents.json.lock
+dir_names.json
+dir_names.json.lock
+log.jsonl
+inbox/
+woke_*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
