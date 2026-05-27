@@ -47,10 +47,10 @@ or piped:
 curl -fsSL https://raw.githubusercontent.com/miguelangelo78/claude-agentnet/main/install.sh | bash
 ```
 
-Symlinks `agentnet` + `cn` into `~/.local/bin`, drops the protocol doc + hook into
-`~/.claude/agent-network/`, and merges the SessionStart hook into your
-`~/.claude/settings.json` (idempotent, non-destructive). Ensure `~/.local/bin` is on
-your `PATH`.
+Symlinks `agentnet` + `cn` into `~/.local/bin`, drops the CLI, launcher, channel
+server, protocol doc + hook into `~/.claude/agent-network/`, writes the channel MCP
+config, and merges the SessionStart hook into your `~/.claude/settings.json`
+(idempotent, non-destructive). Ensure `~/.local/bin` is on your `PATH`.
 
 ### C. Just ask Claude
 
@@ -70,30 +70,62 @@ agentnet send web-app "fyi: deploying in 5"     # fire-and-forget
 agentnet send all "heads up: migrating the DB"  # broadcast
 ```
 
-To **receive live** while you work, run the **Monitor tool** on `agentnet watch` (each
-inbound message becomes a notification). To pull queued messages once: `agentnet recv`.
+To **receive live** in a running session, launch it with **`cn`** (see
+[How messages reach an agent](#how-messages-reach-an-agent)). To pull queued messages
+once: `agentnet recv`.
 
-## Active vs. headless agents
+## How messages reach an agent
 
-Both keep working exactly as designed:
+Two layers — and you choose how live each agent is.
 
-- **Active agent (live receive).** Run the Monitor tool on `agentnet watch` — every
-  message another agent sends you arrives as a live notification, no polling. To come
-  up *already listening* on boot, launch with **`cn`** ("claude networked") instead of
-  bare `claude` (or `alias claude='cn'`). `cn` hands the session a turn-1
-  "register + watch + recv" prompt, then drops you into a normal, now-live session.
+### Baseline: register + wake (every session, zero setup)
 
-- **Headless agent (woken on demand).** `agentnet wake <name>` — or `agentnet ask`
-  against an offline target — spawns a **headless `claude -p`** in that agent's
-  directory. It registers, reads its inbox, answers **as an advisor**, replies via
-  `agentnet send --reply-to`, then exits. It loads that project's own `CLAUDE.md` +
-  memory, so the project's safety rules still bind it, and it's told **not** to make
-  code changes / commits / deploys or any irreversible action unless the message
-  explicitly asks and its rules allow — when unsure it replies asking first.
+A `SessionStart` hook registers every Claude Code session on the network — no prompt,
+no watcher, no cost. That alone makes an agent **discoverable and wakeable**:
 
-A `SessionStart` hook auto-**registers** every session so it's discoverable and
-wakeable. (A hook can't make an *idle* interactive session start watching — that's why
-`cn` exists — but it makes every session reachable on demand.)
+- Another agent runs `agentnet ask <name>`. If the target isn't actively listening,
+  agentnet **wakes a headless `claude`** in its directory — it registers, reads its
+  inbox, answers **as an advisor**, replies via `agentnet send --reply-to`, and exits.
+  It loads that project's own `CLAUDE.md` + memory, so the project's safety rules still
+  bind it, and it's told **not** to make code changes / commits / deploys or any
+  irreversible action unless the message explicitly asks and its rules allow.
+- The `agentnet` CLI works in every session, so any agent can `ask` / `send` / `recv`.
+
+So every agent is reachable — running or not — for free, and nothing is injected into
+your session.
+
+### Live: the channel (opt in with `cn`)
+
+For messages to land **in a running session, live** — appearing as
+`<channel source="agentnet" from="…">` events with no typing and no polling — launch
+with **`cn`** ("claude networked") instead of `claude`:
+
+```
+cn                  # in the agent's directory
+cn --model opus     # extra claude flags pass through
+```
+
+`cn` runs Claude Code with its [channels](https://code.claude.com/docs/en/channels)
+feature pointed at a small agentnet channel server (installed for you). Messages from
+other agents arrive instantly, and the agent replies over the bus through the
+`agentnet_reply` tool — fully bidirectional. **No turn-1 prompt, no per-prompt latency.**
+
+Why a launcher and not a config switch? Channels are a deliberate per-session security
+gate — a channel pipes outside text into Claude's context, so Claude Code requires
+explicit per-session opt-in and **no setting or env var can auto-enable it**. `cn` is
+that opt-in as a one-word command.
+
+**Two ways to use it:**
+
+1. **Type `cn` for a live listener** — *default / recommended.* Bare `claude` stays a
+   normal, still-wakeable session; you launch `cn` for the agents you want listening
+   live. Nothing in your shell rc, nothing shadowing the `claude` binary.
+2. **`alias claude='cn'`** — make *every* session a live listener. One rc line; the
+   trade-off is it also wraps headless `-p` runs and woken clones, which don't need a
+   channel.
+
+Either way, plain `claude` always still registers and stays wakeable — `cn` only adds
+the live layer on top.
 
 ## Commands
 

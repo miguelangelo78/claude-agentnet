@@ -94,6 +94,22 @@ sleep 1.0
 kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
 has  "watch delivers messages live"           "$(cat "$wlog")" "live message"
 
+# 10. CHANNEL: the channel server speaks MCP — declares the claude/channel capability
+#     and the reply tool (this is what `cn` loads via --mcp-config for live delivery)
+CHANNEL="$(dirname "$AGENTNET")/agentnet-channel"
+if [ -x "$CHANNEL" ]; then
+  cout="$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    | timeout 6 python3 "$CHANNEL" 2>/dev/null)"
+  has "channel declares claude/channel capability" "$cout" "claude/channel"
+  has "channel exposes agentnet_reply tool"        "$cout" "agentnet_reply"
+  has "channel answers initialize + tools/list"    "$cout" '"id": 2'
+else
+  echo "  · skipped channel test (agentnet-channel not executable)"
+fi
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

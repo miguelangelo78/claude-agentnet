@@ -2,8 +2,9 @@
 #
 # claude-agentnet installer — sets up the Claude agent network on this machine.
 #   - installs the `agentnet` CLI + `cn` launcher onto your PATH (~/.local/bin)
-#   - drops the CLI, launcher, protocol doc + SessionStart hook into ~/.claude/agent-network/
+#   - drops the CLI, launcher, channel server, protocol doc + SessionStart hook into ~/.claude/agent-network/
 #   - merges a SessionStart hook into ~/.claude/settings.json (auto-registers every session)
+#   - writes the channel MCP config so `cn` can push live messages into a running session
 #
 # Idempotent + non-destructive — re-run any time to update.
 # Works from a clone (bash install.sh) or piped (curl -fsSL .../install.sh | bash).
@@ -32,12 +33,24 @@ mkdir -p "$NET_DIR" "$BIN_DIR" "$(dirname "$SETTINGS")"
 
 cp "$SRC/bin/agentnet"                "$NET_DIR/agentnet"
 cp "$SRC/bin/cn"                      "$NET_DIR/cn"
+cp "$SRC/bin/agentnet-channel"        "$NET_DIR/agentnet-channel"
 cp "$SRC/hooks/session-start-hook.sh" "$NET_DIR/session-start-hook.sh"
 cp "$SRC/PROTOCOL.md"                 "$NET_DIR/README.md"
-chmod +x "$NET_DIR/agentnet" "$NET_DIR/cn" "$NET_DIR/session-start-hook.sh"
+chmod +x "$NET_DIR/agentnet" "$NET_DIR/cn" "$NET_DIR/agentnet-channel" "$NET_DIR/session-start-hook.sh"
 
 ln -sf "$NET_DIR/agentnet" "$BIN_DIR/agentnet"
 ln -sf "$NET_DIR/cn"       "$BIN_DIR/cn"
+
+# Channel MCP config — `cn` passes this via --mcp-config so the live channel server is
+# pulled in ONLY for cn-launched sessions; a bare `claude` never loads it (so it can
+# never drain an inbox). See "How messages reach an agent" in the README.
+cat > "$NET_DIR/channel-mcp.json" <<JSON
+{
+  "mcpServers": {
+    "agentnet": { "command": "python3", "args": ["$NET_DIR/agentnet-channel"] }
+  }
+}
+JSON
 
 # Merge the SessionStart hook into settings.json (idempotent; preserves everything else).
 python3 - "$SETTINGS" "$NET_DIR/session-start-hook.sh" <<'PY'
@@ -73,5 +86,6 @@ echo
 echo "Next:"
 echo "  agentnet agents               # see who's on the network"
 echo "  agentnet ask <name> \"...\"      # consult another agent (blocks for a reply)"
-echo "  Live receive: run the Monitor tool on 'agentnet watch'."
-echo "  Come up listening on boot:    launch 'cn' instead of 'claude'   (or: alias claude='cn')"
+echo "  Live in-session messages:     launch 'cn' instead of 'claude' (channels — no prompt)"
+echo "                                or 'alias claude=cn' to make every session live"
+echo "  Pull queued messages anytime: agentnet recv"

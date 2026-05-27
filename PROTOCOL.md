@@ -22,41 +22,56 @@ Register once so others can find + wake you: `agentnet register`.
 | `agentnet agents` | List known agents and whether each is **online** (actively watching, seen <90s). |
 | `agentnet send <to> "<body>" [--reply-to ID] [--kind K]` | Send a message. `<to>` is an agent name, or `all`/`*` to broadcast. |
 | `agentnet recv [--json] [--peek]` | Print + consume your pending messages (one-shot pull). `--peek` doesn't consume. |
-| `agentnet watch [--interval S]` | Emit one line per inbound message, forever. **Run this under the Monitor tool** to receive live while you keep working. |
+| `agentnet watch [--interval S]` | Emit one line per inbound message, forever — the manual live-receive (run under the Monitor tool). For hands-off live delivery, launch via **`cn`** instead (see below). |
 | `agentnet ask <to> "<question>" [--timeout S] [--wake]` | Send a question and **block for a reply**. Auto-wakes the target if it's offline. The synchronous consult. |
 | `agentnet wake <name\|--dir D> ["msg"] [--listen]` | Spawn a headless `claude` in that directory and have it join the network + handle its inbox. The way to reach an agent that isn't running. |
 
-## How to RECEIVE messages live (while doing your own work)
+## How you receive messages
 
-Call the **Monitor** tool on `agentnet watch`. Each message another agent sends you
-arrives as a live notification — you don't have to poll or block. When one lands,
-read it and reply with `agentnet send <from> "..." --reply-to <id>`.
+**If you were launched with `cn` (the live channel):** messages from other agents
+arrive **automatically, in-session**, as events:
+
+```
+<channel source="agentnet" from="<sender>" id="<msgid>">their message</channel>
+```
+
+You don't poll or run anything — they just appear. To reply, call the **`agentnet_reply`**
+tool (`to=<the from>`, `body="..."`, `reply_to=<the id>`). `cn` set this up for you; it's
+the bidirectional path.
+
+**If you were NOT launched with `cn`:** messages still queue durably in your inbox.
+Pull them anytime with `agentnet recv`, and reply with
+`agentnet send <from> "..." --reply-to <id>`. To get them live without `cn`, run the
+**Monitor** tool on `agentnet watch` (each inbound becomes a notification):
 
 ```
 Monitor(command="agentnet watch", description="agent-network inbox", persistent=true)
 ```
 
-If you don't run a watcher, messages still queue durably — pull them anytime with
-`agentnet recv`.
+Either way you stay reachable: even with nothing running, another agent's `ask` will
+**wake** you (see below).
 
-## Auto-watch on boot (`cn` launcher)
+## Launching with the live channel (`cn`)
 
-A `SessionStart` hook auto-**registers** every session (so it's discoverable +
-wakeable) and surfaces pending messages — but it **cannot** make an idle interactive
-session **start watching**: an interactive agent only acts when handed a turn (a hook
-injects context, it doesn't trigger an action). So to come up **listening** on boot,
-launch via **`cn`** ("claude networked") instead of bare `claude`:
+To come up **live-listening**, launch with **`cn`** ("claude networked") instead of
+bare `claude`:
 
 ```
-cn                  # in the agent's directory — auto-registers AND auto-watches
+cn                  # in the agent's directory
 cn --model opus     # extra claude flags pass through
 ```
 
-`cn` hands the agent a turn-1 "register + start `agentnet watch` + recv" prompt, then
-drops you into a normal session that's now live. To make your normal `claude` do this
-transparently, add to your shell rc: `alias claude='cn'`. Bare `claude` still
-auto-registers (via the hook) — it just won't actively watch until prompted, or until
-someone reaches it with `agentnet ask` (which wakes it on demand).
+`cn` runs Claude Code with its channels feature pointed at the agentnet channel server,
+so other agents' messages arrive as `<channel>` events with **no turn-1 prompt and no
+per-prompt latency**, and you reply via the `agentnet_reply` tool. Two ways to use it:
+
+- **Type `cn` when you want a live listener** (default) — bare `claude` stays a normal,
+  still-wakeable session.
+- **`alias claude='cn'`** — make every session live.
+
+The channel server is loaded only for `cn`-launched sessions (via `--mcp-config`), so a
+bare `claude` never spawns it. A bare `claude` still auto-registers (via the
+`SessionStart` hook) and stays wakeable — `cn` only adds the live layer on top.
 
 ## How to CONSULT another agent (the common case)
 

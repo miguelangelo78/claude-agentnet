@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""agentnet-channel — a Claude Code *Channel* source backed by agentnet.
+
+Runs as an MCP stdio server. It declares the experimental `claude/channel`
+capability and then PUSHES each agentnet message addressed to THIS agent into
+the running Claude Code session as a `notifications/claude/channel` event — so
+messages appear live, in-session, as:
+
+    <channel source="agentnet" from="<sender>" id="<msgid>">body</channel>
+
+with no turn-1 prompt and no per-prompt latency. It also exposes an
+`agentnet_reply` tool so the session can answer back over the bus.
+
+Launch (during the research preview, custom channels need the dev flag):
+    claude --dangerously-load-development-channels server:agentnet
+
+Pure stdlib. Delegates inbox/registry work to the `agentnet` CLI so it never
+re-implements (or diverges from) the bus's own consume semantics.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+# Resolve the agentnet CLI the same way the SessionStart hook does.
+AGENTNET = shutil.which("agentnet") or os.path.expanduser("~/.local/bin/agentnet")
+if not os.path.exists(AGENTNET):
+    AGENTNET = os.path.expanduser("~/.claude/agent-network/agentnet")
+
+POLL_SECONDS = 2.0
+
+
+def _agentnet(*args, timeout=10):
+    return subprocess.run(
+        [AGENTNET, *args], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _whoami():
+    try:
+        return _agentnet("whoami").stdout.strip() or "agentnet"
+    except Exception:
+        return "agentnet"
+
+
+NAME = _whoami()
+
+_out_lock = threading.Lock()
+
+
+def _write(obj):
+    with _out_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def _result(rid, result):
+    _write({"jsonrpc": "2.0", "id": rid, "result": result})
+
+
+def _error(rid, code, message):
+    _write({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
+
+
+def _notify(method, params):
+    _write({"jsonrpc": "2.0", "method": method, "params": params})
+
+
+def _push_channel_event(msg):
+    """Turn one agentnet message into a <channel> event in the session."""
+    meta = {"from": msg.get("from", ""), "id": msg.get("id", "")}
+    if msg.get("reply_to"):
+        meta["reply_to"] = msg["reply_to"]
+    _notify(
+        "notifications/claude/channel",
+        {"content": msg.get("body", ""), "meta": meta},
+    )
+
+
+def poll_inbox():
+    """Background loop: register, then drain our inbox and push each message."""
+    try:
+        _agentnet("register")
+    except Exception:
+        pass
+    while True:
+        try:
+            r = _agentnet("recv", "--json")
+            msgs = json.loads(r.stdout or "[]")
+            for m in msgs:
+                _push_channel_event(m)
+        except Exception:
+            pass
+        time.sleep(POLL_SECONDS)
+
+
+TOOLS = [
+    {
+        "name": "agentnet_reply",
+        "description": (
+            'Reply to an agent over the agentnet bus. Use this to answer a '
+            '<channel source="agentnet"> message: pass to=<the "from" of that '
+            "message>, your text, and (if present) reply_to=<its id>."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "agent name to send to"},
+                "body": {"type": "string", "description": "message text"},
+                "reply_to": {
+                    "type": "string",
+                    "description": "optional id of the message you're answering",
+                },
+            },
+            "required": ["to", "body"],
+        },
+    }
+]
+
+
+def _handle(req):
+    method = req.get("method")
+    rid = req.get("id")
+
+    if method == "initialize":
+        params = req.get("params") or {}
+        proto = params.get("protocolVersion", "2025-06-18")
+        _result(
+            rid,
+            {
+                "protocolVersion": proto,
+                "capabilities": {
+                    "experimental": {"claude/channel": {}},
+                    "tools": {},
+                },
+                "serverInfo": {"name": "agentnet", "version": "0.1.0"},
+                "instructions": (
+                    f"You are agent '{NAME}'. Messages from other agents arrive "
+                    'as <channel source="agentnet" from="<name>" id="<id>">body'
+                    "</channel>. When one expects an answer, reply with the "
+                    "agentnet_reply tool (to=<from>, body=..., reply_to=<id>)."
+                ),
+            },
+        )
+    elif method == "notifications/initialized":
+        pass  # notification — no response
+    elif method == "tools/list":
+        _result(rid, {"tools": TOOLS})
+    elif method == "tools/call":
+        params = req.get("params") or {}
+        args = params.get("arguments") or {}
+        if params.get("name") == "agentnet_reply":
+            cmd = ["send", args.get("to", ""), args.get("body", "")]
+            if args.get("reply_to"):
+                cmd += ["--reply-to", args["reply_to"]]
+            cmd += ["--no-wake"]
+            try:
+                rr = _agentnet(*cmd)
+                text = (rr.stdout or rr.stderr or "sent").strip()
+            except Exception as e:
+                _result(rid, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
+                return
+            _result(rid, {"content": [{"type": "text", "text": text}]})
+        else:
+            _result(rid, {"content": [{"type": "text", "text": "unknown tool"}], "isError": True})
+    elif rid is not None:
+        _error(rid, -32601, f"method not found: {method}")
+
+
+def main():
+    threading.Thread(target=poll_inbox, daemon=True).start()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        try:
+            _handle(req)
+        except Exception as e:
+            sys.stderr.write(f"agentnet-channel error: {e}\n")
+
+
+if __name__ == "__main__":
+    main()
