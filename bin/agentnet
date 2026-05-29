@@ -22,18 +22,20 @@ from datetime import datetime, timezone
 
 ROOT = os.path.join(os.path.expanduser("~"), ".claude", "agent-network")
 INBOX = os.path.join(ROOT, "inbox")
+LOCKS = os.path.join(ROOT, "locks")           # per-agent wake locks (single-worker guard)
 AGENTS = os.path.join(ROOT, "agents.json")
 DIRNAMES = os.path.join(ROOT, "dir_names.json")
 LOG = os.path.join(ROOT, "log.jsonl")
 ONLINE_WINDOW_S = 90          # "online" = actively watching within this window
 WATCH_HEARTBEAT_EVERY_S = 5   # watch refreshes presence this often
-WAKE_DEBOUNCE_S = 20          # send auto-wakes an offline target, but not if woken this recently (one wake drains all queued msgs)
 ACTIVELY_WATCHING_S = WATCH_HEARTBEAT_EVERY_S * 3  # ~15s. A live `watch` refreshes every 5s, so a heartbeat older than this means NOT actually watching (e.g. a headless agent that finished + exited leaves a stale-but-recent heartbeat). A send must then RE-WAKE rather than assume the msg is seen.
+MAX_DRAIN_ITERS = 25          # wake-worker shepherd: max claude runs in one drain-loop (safety cap against a worker that never empties its inbox)
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def now_ms(): return int(time.time() * 1000)
 def ensure_dirs():
     os.makedirs(INBOX, exist_ok=True)
+    os.makedirs(LOCKS, exist_ok=True)
 
 def _load(path, default):
     try:
@@ -68,20 +70,6 @@ def heartbeat(name, dir_=None):
         e["last_seen"] = now_iso()
         d[name] = e
     _update_json(AGENTS, fn)
-
-def _mark_woke(name):
-    """Record that we just spawned a wake for `name` (debounces send auto-wake)."""
-    def fn(d):
-        e = d.get(name, {})
-        e["last_woke"] = now_iso()
-        d[name] = e
-    _update_json(AGENTS, fn)
-
-def _woke_recently(entry):
-    last = (entry or {}).get("last_woke")
-    if not last: return False
-    try: return (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() < WAKE_DEBOUNCE_S
-    except Exception: return False
 
 def is_online(entry):
     try:
@@ -191,12 +179,8 @@ def cmd_send(a):
         print(f"  ↳ '{t}' is offline with no known dir — message QUEUED but not delivered live. "
               f"`agentnet wake {t} --dir <dir>` (or have it register once) to deliver.", file=sys.stderr)
         return
-    if _woke_recently(entry):
-        print(f"  ↳ '{t}' offline but woken moments ago — it'll read this on that wake.", file=sys.stderr)
-        return
-    _mark_woke(t)
     _wake(t, d, None, quiet=True)
-    print(f"  ↳ '{t}' was offline — woke it to deliver (headless agents drain queued messages on wake).", file=sys.stderr)
+    print(f"  ↳ '{t}' was offline — woke it (a SINGLE headless worker drains ALL queued messages; concurrent/repeat wakes coalesce into it, never duplicate instances).", file=sys.stderr)
 
 def _print_msg(m, as_json):
     if as_json: print(json.dumps(m)); return
@@ -250,13 +234,8 @@ def cmd_ask(a):
         time.sleep(1)
     print(f"\n(timeout — no reply from {target} within {a.timeout}s; it may still reply later — `agentnet recv`)")
 
-def _wake(name, dir_, message, quiet=False, listen=False):
-    d = dir_ or _load(AGENTS, {}).get(name, {}).get("dir")
-    if not d or not os.path.isdir(d):
-        print(f"wake: don't know a directory for '{name}'. Pass --dir, or have it `agentnet register` once.", file=sys.stderr)
-        sys.exit(2)
-    me = whoami()
-    prompt = (
+def _wake_prompt(name, me, message, listen):
+    return (
         f"You have been woken as part of the Claude agent network (agent name '{name}'). "
         f"Another agent ('{me}') needs you. FIRST run `agentnet register {name}` then "
         f"`agentnet recv` to read the message(s) addressed to you. Act on them as an ADVISOR: "
@@ -268,22 +247,74 @@ def _wake(name, dir_, message, quiet=False, listen=False):
         f"inbox and the sender never sees it. "
         f"Do NOT make code changes, commits, deploys, or any irreversible/outward-facing action "
         f"unless the message explicitly asks AND your own CLAUDE.md/safety rules allow it — when unsure, "
-        f"reply asking for confirmation instead. The protocol is in ~/.claude/agent-network/README.md "
-        f""
-        + (f"To stay reachable afterward, you may keep watching with the Monitor tool on `agentnet watch`. " if listen else "When done replying, you may stop. ")
+        f"reply asking for confirmation instead. The protocol is in ~/.claude/agent-network/README.md. "
+        + ("To stay reachable afterward, you may keep watching with the Monitor tool on `agentnet watch`. " if listen else "When done replying, you may stop. ")
         + (f"\n\nThe message: {message}" if message else "")
     )
-    log = os.path.join(ROOT, f"woke_{name}.log")
-    cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
-    model = os.environ.get("AGENTNET_WAKE_MODEL")  # optional: e.g. 'sonnet' for cheaper/faster woken agents
-    if model: cmd += ["--model", model]
-    with open(log, "a") as lf:
-        lf.write(f"\n\n===== wake {name} @ {now_iso()} (by {me}) =====\n")
-        # detached so the woken agent runs independently; output -> log
-        subprocess.Popen(cmd, cwd=d, stdout=lf, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+
+def _wake(name, dir_, message, quiet=False, listen=False):
+    """Ensure (at most) ONE headless worker is running for `name`.
+
+    Previously this spawned `claude -p` directly on every call — so N messages
+    to an offline agent over time spawned N racing `claude` instances (a long-
+    running woken agent outlives the old time-debounce, and each later send
+    re-spawned). Now we spawn a detached SHEPHERD (`__wake-worker`) that takes a
+    per-agent flock: the first shepherd wins the lock and runs claude; any
+    concurrent/later wake's shepherd finds the lock held and exits at once. The
+    winning shepherd DRAIN-LOOPS (re-running claude while messages keep arriving),
+    so a single worker delivers everything — never duplicates.
+    """
+    d = dir_ or _load(AGENTS, {}).get(name, {}).get("dir")
+    if not d or not os.path.isdir(d):
+        print(f"wake: don't know a directory for '{name}'. Pass --dir, or have it `agentnet register` once.", file=sys.stderr)
+        sys.exit(2)
+    me = whoami()
+    cmd = [sys.executable, os.path.realpath(__file__), "__wake-worker", name, "--dir", d, "--by", me]
+    if message: cmd += ["--message", message]
+    if listen: cmd += ["--listen"]
+    # Detached: the shepherd outlives this CLI call; its claude output -> woke_<name>.log (written inside the shepherd).
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
     if not quiet:
-        print(f"woke '{name}' in {d} (headless claude, log: {log})")
+        print(f"woke '{name}' in {d} (single-worker headless claude, log: {os.path.join(ROOT, f'woke_{name}.log')})")
+
+def cmd_wake_worker(a):
+    """Internal shepherd (not a user verb): holds a per-agent flock so only ONE
+    runs per agent, then loops `claude -p` until the agent's inbox is drained."""
+    name = slug(a.name)
+    d = a.dir or _load(AGENTS, {}).get(name, {}).get("dir")
+    if not d or not os.path.isdir(d):
+        sys.exit(2)
+    ensure_dirs()
+    lf = open(os.path.join(LOCKS, f"{name}.wake.lock"), "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another worker already owns this agent — it will drain the queue; don't duplicate
+    log = os.path.join(ROOT, f"woke_{name}.log")
+    prompt = _wake_prompt(name, a.by or "another agent", a.message, a.listen)
+    # `claude -p ...`; AGENTNET_WAKE_CMD overrides the launched command for tests.
+    test_cmd = os.environ.get("AGENTNET_WAKE_CMD")
+    base = test_cmd.split() if test_cmd else ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
+    if not test_cmd:
+        model = os.environ.get("AGENTNET_WAKE_MODEL")  # optional: 'sonnet' for cheaper/faster woken agents
+        if model: base += ["--model", model]
+    try:
+        prev_oldest = None
+        for _ in range(MAX_DRAIN_ITERS):
+            with open(log, "a") as lfh:
+                lfh.write(f"\n\n===== wake {name} @ {now_iso()} (by {a.by}) =====\n")
+                subprocess.run(base, cwd=d, stdout=lfh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            p = pending(name)
+            if not p:
+                break                       # inbox fully drained → done
+            oldest = p[0][0]
+            if oldest == prev_oldest:
+                break                       # worker didn't consume the oldest msg → stop (avoid a hot loop)
+            prev_oldest = oldest
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
 
 def cmd_wake(a):
     _wake(slug(a.name) if a.name else slug(os.path.basename(a.dir or os.getcwd())),
@@ -316,6 +347,11 @@ def main():
 
     sp = sub.add_parser("wake"); sp.add_argument("name", nargs="?"); sp.add_argument("--dir")
     sp.add_argument("message", nargs="?"); sp.add_argument("--listen", action="store_true"); sp.set_defaults(func=cmd_wake)
+
+    sp = sub.add_parser("__wake-worker")  # internal: single-worker shepherd spawned by _wake (not a user verb)
+    sp.add_argument("name"); sp.add_argument("--dir"); sp.add_argument("--by")
+    sp.add_argument("--message"); sp.add_argument("--listen", action="store_true")
+    sp.set_defaults(func=cmd_wake_worker)
 
     a = p.parse_args()
     a.func(a)

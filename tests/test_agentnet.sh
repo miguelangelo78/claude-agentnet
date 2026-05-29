@@ -23,6 +23,7 @@ export STUB_LOG="$STUB_DIR/calls.log"; : > "$STUB_LOG"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 echo "STUB_CLAUDE_CALLED cwd=$PWD args=$*" >> "$STUB_LOG"
+sleep "${STUB_SLEEP:-0}"   # optional hold, so the single-worker test can overlap concurrent wakes on the lock
 STUB
 chmod +x "$STUB_DIR/claude"
 export PATH="$STUB_DIR:$PATH"
@@ -109,6 +110,24 @@ if [ -x "$CHANNEL" ]; then
 else
   echo "  · skipped channel test (agentnet-channel not executable)"
 fi
+
+# 11. SINGLE-WORKER: concurrent wakes for ONE agent must spawn only ONE claude
+#     (regression for the wake-storm — N sends to an offline agent used to spawn
+#     N racing `claude -p` instances). A slow stub makes the winner hold the
+#     per-agent flock long enough that the other shepherds collide on it + exit.
+: > "$STUB_LOG"
+STUB_SLEEP=1.5 AGENTNET_NAME=alice an wake worker1 --dir "$STUB_DIR" >/dev/null 2>&1 &
+STUB_SLEEP=1.5 AGENTNET_NAME=alice an wake worker1 --dir "$STUB_DIR" >/dev/null 2>&1 &
+STUB_SLEEP=1.5 AGENTNET_NAME=alice an wake worker1 --dir "$STUB_DIR" >/dev/null 2>&1 &
+wait                       # the 3 CLI calls return after spawning detached shepherds
+sleep 2.5                  # let the single winning worker's (slow) claude run + drain-loop finish
+eq   "3 concurrent wakes spawn exactly ONE worker" "$(grep -c STUB_CLAUDE_CALLED "$STUB_LOG")" "1"
+
+# 12. and a 4th wake AFTER the worker exited spawns a fresh single worker (lock released cleanly)
+: > "$STUB_LOG"
+AGENTNET_NAME=alice an wake worker1 --dir "$STUB_DIR" >/dev/null 2>&1
+sleep 0.5
+eq   "a later wake (lock free) spawns one worker"  "$(grep -c STUB_CLAUDE_CALLED "$STUB_LOG")" "1"
 
 echo
 echo "RESULT: $pass passed, $fail failed"
