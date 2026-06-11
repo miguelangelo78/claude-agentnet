@@ -48,6 +48,52 @@ def _whoami():
 
 NAME = _whoami()
 
+# --- single-reader election (fixes the recurring duplicate-daemon "channel went
+# dark" bug) -------------------------------------------------------------------
+# More than one agentnet-channel daemon can be alive for the SAME agent: one
+# orphaned from a previous session, or an MCP respawn that didn't replace the old
+# one. Each calls `recv` (which CONSUMES) on the same inbox every poll, so a
+# message is won by whichever daemon polls first; if that is a dead-session
+# daemon, the live session never sees it. Fix: only the daemon serving a LIVE MCP
+# transport drains. A daemon marks itself live on `initialize` and claims an owner
+# file; only the live owner drains. A non-owner whose recorded owner has DIED
+# reclaims, so a surviving live daemon takes over with no stale-lock deadlock.
+_LIVE = threading.Event()                       # set once we serve a live MCP session
+_ROOT = os.path.join(os.path.expanduser("~"), ".claude", "agent-network")
+_OWNER_FILE = os.path.join(_ROOT, "locks", f"{NAME}.channel-owner")
+
+
+def _claim_owner():
+    try:
+        os.makedirs(os.path.dirname(_OWNER_FILE), exist_ok=True)
+        with open(_OWNER_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def _owner_pid():
+    try:
+        with open(_OWNER_FILE) as f:
+            return int(f.read().strip() or "0")
+    except Exception:
+        return 0
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
 _out_lock = threading.Lock()
 
 
@@ -81,12 +127,21 @@ def _push_channel_event(msg):
 
 
 def poll_inbox():
-    """Background loop: register, then drain our inbox and push each message."""
-    try:
-        _agentnet("register")
-    except Exception:
-        pass
+    """Background loop: as the SOLE elected reader for a LIVE session, drain our
+    inbox and push each message. See the single-reader notes above — a daemon that
+    is not serving a live MCP transport (e.g. a stale orphan) never drains, so it
+    can neither steal messages from nor mask the absence of the live session."""
+    mypid = os.getpid()
     while True:
+        if not _LIVE.is_set():
+            time.sleep(POLL_SECONDS)            # not a live transport — never drain
+            continue
+        owner = _owner_pid()
+        if owner != mypid and _pid_alive(owner):
+            time.sleep(POLL_SECONDS)            # another live daemon owns the inbox
+            continue
+        if owner != mypid:
+            _claim_owner()                      # recorded owner is gone — take over
         try:
             r = _agentnet("recv", "--json")
             msgs = json.loads(r.stdout or "[]")
@@ -126,6 +181,14 @@ def _handle(req):
     rid = req.get("id")
 
     if method == "initialize":
+        # This daemon is serving a live MCP session → it becomes the agent's sole
+        # inbox reader (register for presence, claim ownership, enable draining).
+        try:
+            _agentnet("register")
+        except Exception:
+            pass
+        _claim_owner()
+        _LIVE.set()
         params = req.get("params") or {}
         proto = params.get("protocolVersion", "2025-06-18")
         _result(

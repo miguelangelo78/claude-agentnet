@@ -129,6 +129,32 @@ AGENTNET_NAME=alice an wake worker1 --dir "$STUB_DIR" >/dev/null 2>&1
 sleep 0.5
 eq   "a later wake (lock free) spawns one worker"  "$(grep -c STUB_CLAUDE_CALLED "$STUB_LOG")" "1"
 
+# 13. SINGLE-READER: two channel daemons for ONE agent must NOT both consume the
+#     same inbox (regression for the duplicate-daemon "channel went dark" split-
+#     brain — a stale/duplicate daemon used to race the live one and steal msgs).
+#     Both are fed `initialize` (both "live"); the message must be delivered
+#     EXACTLY ONCE across the two — never twice (double-consume) or zero (lost).
+if [ -x "$CHANNEL" ]; then
+  AGENTNET_NAME=bob an send dora "single-reader-probe" --no-wake >/dev/null 2>&1
+  o1="$STUB_DIR/d1.out"; o2="$STUB_DIR/d2.out"
+  init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+  { printf '%s\n' "$init"; sleep 4; } | AGENTNET_NAME=dora timeout 6 python3 "$CHANNEL" >"$o1" 2>/dev/null &
+  { printf '%s\n' "$init"; sleep 4; } | AGENTNET_NAME=dora timeout 6 python3 "$CHANNEL" >"$o2" 2>/dev/null &
+  wait
+  eq "two live channel daemons deliver a message exactly ONCE" \
+     "$(cat "$o1" "$o2" | grep -c 'single-reader-probe')" "1"
+
+  # 14. and a daemon that NEVER got `initialize` (a stale orphan) must NOT drain,
+  #     so it can't steal messages destined for the live session.
+  AGENTNET_NAME=bob an send erin "noinit-probe" --no-wake >/dev/null 2>&1
+  { sleep 4; } | AGENTNET_NAME=erin timeout 6 python3 "$CHANNEL" >/dev/null 2>&1 &
+  wait
+  has "a non-initialized daemon does NOT drain the inbox" \
+      "$(AGENTNET_NAME=erin an recv --peek --json)" "noinit-probe"
+else
+  echo "  · skipped single-reader test (agentnet-channel not executable)"
+fi
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
