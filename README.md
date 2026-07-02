@@ -204,6 +204,59 @@ agentnet ask  server:bob "build green?"    # consult across pools, block for the
 Your own pool has a name too (`self` in the config; default: your hostname). Within your
 pool keep using bare names — the `pool:` prefix is only for reaching *other* pools.
 
+### Adding a remote (step by step)
+
+To connect your pool to another box's pool:
+
+1. **Name it, and note the direction.** Pick a short pool name (e.g. `server`). Can you SSH
+   *to* that box? → it's **reachable** (you push to it). Can it SSH *back* to you? If not
+   (e.g. you're a laptop behind NAT), the link is one-way — you'll push *and* pull, and
+   nothing ever connects into you.
+
+2. **Make it reachable (reachable remotes only).** Install agentnet on the remote box and
+   make sure it's on its non-interactive PATH (the installer puts it in `~/.local/bin`), and
+   that key-based SSH works — `ssh user@host agentnet whoami` should print a name. For least
+   privilege, use a dedicated key pinned with `command="agentnet …"` in the remote's
+   `authorized_keys`.
+
+3. **Add it to your `remotes.json`.** Create `~/.claude/agent-network/remotes.json` if it
+   doesn't exist, set `self` to your own pool name, and add the remote:
+
+   ```json
+   { "self": "laptop",
+     "remotes": {
+       "server": { "ssh": "user@host" }
+     } }
+   ```
+
+   No SSH route to it? List it as `{ "reachable": false }` instead — you'll spool to it and
+   it pulls.
+
+4. **For a one-way link, add yourself on the *other* side.** So the remote's agents can
+   **reply** across a NAT boundary, add your pool to the **remote's** `remotes.json` as
+   pull-only — it can't connect to you, so it spools your replies for you to pull:
+
+   ```jsonc
+   // on the server:  ~/.claude/agent-network/remotes.json
+   { "self": "server",
+     "remotes": { "laptop": { "reachable": false } } }
+   ```
+
+   If both boxes can SSH to each other, skip this — just list each other with `"ssh"`, and
+   both directions push.
+
+5. **Verify.**
+
+   ```
+   agentnet remotes                        # your pool + its configured remotes
+   agentnet agents --all                   # everyone across the federation
+   agentnet send server:someagent "ping"   # cross-pool send
+   agentnet recv                           # pulls any replies spooled for you
+   ```
+
+Env-var form works too, for quick or temporary setups (no file):
+`AGENTNET_SELF=laptop AGENTNET_REMOTES="server=user@host" agentnet agents --all`.
+
 ### Is it bidirectional? (who SSHes to whom)
 
 **Messages flow any-to-any** — any pool can reach any other. But the **SSH connections are
