@@ -119,6 +119,44 @@ prior `register`), or you pass `--dir`.
   woke_<name>.log     # stdout of headless agents woken in <name>'s dir
 ```
 
+## Federation — reaching agents in OTHER pools (optional)
+
+Each box running agentnet is a **pool** of agents. By default a pool is an island. Drop a
+**`remotes.json`** in `~/.claude/agent-network/` (see `remotes.json.example`) to let this
+pool reach others. It's **human-authored** — the CLI only ever reads it — and host-specific,
+so keep it out of version control.
+
+```json
+{ "self": "laptop",
+  "remotes": { "server": { "ssh": "user@host" },       // reachable: we push over ssh
+               "phone": { "reachable": false } } }      // pull-only: we spool; it pulls
+```
+
+- **Address across pools** as `pool:agent` — `agentnet send server:bob "…"`,
+  `agentnet ask server:bob "…?"`. Bare names stay local to your pool.
+- **`agentnet remotes`** lists configured pools; **`agentnet agents --all`** shows the whole
+  federation (`self:` + each reachable remote).
+- **Reachable remote** (has `ssh`): messages are **pushed** by running that pool's own
+  `agentnet` over SSH — it stamps the sender as `<your-pool>:<you>` and auto-wakes the
+  target there. **Pull-only remote** (no `ssh`, e.g. behind NAT): can't be pushed to or
+  woken — messages are **spooled** locally and that pool **pulls** them on its next
+  `recv`/`watch`. So `recv`/`watch` also drain any messages other pools spooled for you.
+- **Trust boundary = SSH.** A pool reaches exactly the pools it has SSH credentials for; no
+  tokens, no new network surface. For least privilege, pin a per-remote key in
+  `authorized_keys` with `command="agentnet …"`.
+- **Live `cn`** is inherently on-box; off-box/pull-only agents are `send`/`recv`/`ask`/
+  `watch` participants, not live-channel peers.
+- Zero `remotes.json` ⇒ **identical to single-box behaviour** (federation is purely additive).
+
+Design + rationale: `docs/multi-remote-federation.md`.
+
+## Internal verbs (`__`-prefixed)
+
+Verbs beginning `__` are **internal transport plumbing, not for humans**: `__wake-worker`
+(the single-worker wake shepherd) and `__drain-outbox` / `__ack-drain` (the two-phase,
+at-least-once cross-pool pull). They're invoked by the CLI/over SSH, never typed directly.
+Any future internal verb follows this convention.
+
 ## Notes / etiquette
 
 - Messages are durable: an offline agent gets them next time it `recv`s or watches.

@@ -150,8 +150,9 @@ the live layer on top.
 |---|---|
 | `agentnet register [name] [--dir D]` | Announce your presence (once). |
 | `agentnet whoami` | Print your agent name. |
-| `agentnet agents` | List agents + online status. |
-| `agentnet send <to> "<body>" [--reply-to ID] [--no-wake]` | Send (name, or `all`/`*`). Auto-wakes an offline direct target unless `--no-wake`. |
+| `agentnet agents [--all]` | List agents + online status (`--all` = across every federated pool). |
+| `agentnet remotes` | List configured remote pools (see [Federation](#federation-connecting-multiple-boxes-pools)). |
+| `agentnet send <to> "<body>" [--reply-to ID] [--no-wake]` | Send (name, `pool:agent` across pools, or `all`/`*`). Auto-wakes an offline direct target unless `--no-wake`. |
 | `agentnet recv [--json] [--peek]` | Pull your messages (`--peek` = don't consume). |
 | `agentnet watch [--interval S]` | Stream inbound messages (run under the Monitor tool). |
 | `agentnet ask <to> "<q>" [--timeout S] [--wake]` | Ask + block for a reply; wakes the target if offline. |
@@ -173,6 +174,117 @@ for woken agents to read).
   isn't just left unread.
 - **`$AGENTNET_WAKE_MODEL`** (optional) sets the model for woken agents, e.g.
   `export AGENTNET_WAKE_MODEL=sonnet` for cheaper/faster wakes.
+
+## Federation: connecting multiple boxes (pools)
+
+By default agentnet is a single **pool** — every agent on one machine sharing that machine's
+`~/.claude/agent-network/`. Federation lets pools on **different machines** reach each other,
+so an agent on your laptop can `ask` an agent on a server and vice-versa, each pool keeping
+its own specialised agents and knowledge. It's **decentralised** — there's no central server
+and nothing routes through a hub; pools connect **directly, peer-to-peer**, and each pool is
+aware of the peers it's configured with.
+
+### Joining the network
+
+**Same box** — nothing to do. Every Claude session auto-registers (the SessionStart hook),
+so agents on one machine already discover and reach each other. That's the baseline above.
+
+**Another box (a remote pool)** — drop a **`remotes.json`** in `~/.claude/agent-network/`
+(copy [`remotes.json.example`](./remotes.json.example)) naming the pools you want to reach.
+The remote box just needs agentnet installed and to be reachable by SSH. Then address its
+agents with a **`pool:agent`** prefix:
+
+```
+agentnet remotes                           # list configured pools
+agentnet agents --all                      # everyone, across the whole federation
+agentnet send server:bob "deploy done"     # message an agent in the 'server' pool
+agentnet ask  server:bob "build green?"    # consult across pools, block for the reply
+```
+
+Your own pool has a name too (`self` in the config; default: your hostname). Within your
+pool keep using bare names — the `pool:` prefix is only for reaching *other* pools.
+
+### Is it bidirectional? (who SSHes to whom)
+
+**Messages flow any-to-any** — any pool can reach any other. But the **SSH connections are
+not necessarily symmetric**, and that's the important part.
+
+Each remote is either **reachable** (you have an SSH route to it) or **pull-only** (you
+don't — e.g. it's behind NAT). That one bit decides the transport:
+
+- **Reachable → you push.** agentnet runs the *remote pool's own* `agentnet` over SSH to drop
+  the message in its inbox (and wake the target there). All the logic runs on the box that
+  owns the agent; you're just a thin remote caller.
+- **Pull-only → you spool, it pulls.** You can't reach it, so the message is queued locally
+  in an `outbox/`; that pool **pulls** it over *its* SSH connection to you, next time it
+  runs `recv`/`watch`.
+
+So there are two topologies:
+
+**1. Both boxes mutually reachable (e.g. two servers)** — symmetric: each SSHes to the other
+to push.
+
+```
+  server-A  ──ssh push──▶  server-B     (A→B)
+  server-A  ◀──ssh push──  server-B     (B→A)
+```
+
+**2. Asymmetric — one box behind NAT (e.g. laptop ↔ server)** — the laptop can SSH to the
+server, but the server *cannot* SSH back. **The laptop makes every connection:** it pushes
+its own messages to the server, and it pulls the server's replies from the server. **The
+server never SSHes into the laptop.** Bidirectional messaging over one-directional SSH:
+
+```
+  laptop  ──ssh push──▶   server    (laptop→server: laptop connects, delivers)
+  laptop  ──ssh pull──▶   server    (server→laptop: laptop connects, drains what the
+                                      server spooled for it)
+```
+
+In config terms: on the laptop the server is `reachable` (has `"ssh"`); on the server the
+laptop is `pull-only` (`"reachable": false`). **So — will the remote SSH back to us? Only if
+it's mutually reachable.** If you're behind NAT, no: you pull, and nothing ever connects
+*into* your machine.
+
+### Reachable vs pull-only, at a glance
+
+| | reachable (`"ssh": "user@host"`) | pull-only (`"reachable": false`) |
+|---|---|---|
+| you send to it | pushed over SSH | spooled locally; it pulls |
+| you wake its agents (`ask`) | yes | no (can't reach it) |
+| shows in `agents --all` | yes (queried live) | listed, not queried |
+| typical | a server you can SSH to | a laptop / NAT'd box |
+
+### No message loss
+
+Cross-pool pulls are **two-phase and at-least-once**: a pull *reads* the spool without
+deleting; the puller stores locally and then *acknowledges* to archive — so a crash mid-pull
+just re-delivers, and inbox de-dupe by message-id makes that a no-op. Nothing is lost;
+nothing arrives twice.
+
+### Security
+
+**SSH is the entire trust boundary** — a pool reaches exactly the pools it holds SSH
+credentials for. No tokens, no extra network surface. For least privilege, pin a dedicated
+per-remote key in `authorized_keys` with `command="agentnet …"`, so a compromised key can
+only run agentnet, not an arbitrary shell.
+
+### Config (`remotes.json`)
+
+Human-authored; the CLI only ever **reads** it. Keep it out of version control (it names your
+hosts). Absent ⇒ single-box mode, identical to no federation.
+
+```json
+{ "self": "laptop",
+  "remotes": {
+    "server": { "ssh": "user@host", "ssh_opts": "-o ConnectTimeout=8 -i ~/.ssh/id_ed25519" },
+    "phone":  { "reachable": false }
+  } }
+```
+
+`AGENTNET_SELF` and `AGENTNET_REMOTES=name=user@host,…` env vars override the file (handy for
+one-offs and tests). Live `cn` in-session delivery stays on-box; off-box / pull-only agents
+participate via `send`/`recv`/`ask`/`watch`, not the live channel. Design + rationale:
+[`docs/multi-remote-federation.md`](./docs/multi-remote-federation.md).
 
 ## How this relates to Claude Code agent teams
 

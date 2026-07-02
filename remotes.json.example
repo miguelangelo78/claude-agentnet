@@ -1,0 +1,19 @@
+{
+  "__comment": "Federation config — HUMAN-authored. Copy to ~/.claude/agent-network/remotes.json and edit. The agentnet CLI ONLY READS this file (never rewrites it). Absent ⇒ single-box mode (identical to no-federation). Keep your real remotes.json out of version control (it names your hosts).",
+
+  "self": "laptop",
+
+  "remotes": {
+    "server": {
+      "__doc": "A REACHABLE pool: has an ssh target, so we PUSH to it (and can wake its agents). Address its agents as server:<agent>.",
+      "ssh": "user@server.example.com",
+      "ssh_opts": "-o ConnectTimeout=8 -i ~/.ssh/id_ed25519",
+      "bin": "agentnet"
+    },
+
+    "phone": {
+      "__doc": "A PULL-ONLY pool: no ssh route from here (e.g. it is behind NAT). We cannot push or wake it; messages to phone:<agent> are SPOOLED locally and that pool PULLS them on its next recv/watch.",
+      "reachable": false
+    }
+  }
+}

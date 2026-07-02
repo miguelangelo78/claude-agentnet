@@ -6,7 +6,9 @@ dir_names.json
 dir_names.json.lock
 log.jsonl
 inbox/
+outbox/
 woke_*.log
+remotes.json          # federation config is HUMAN-authored + host-specific — never commit it (see remotes.json.example)
 
 # Python
 __pycache__/

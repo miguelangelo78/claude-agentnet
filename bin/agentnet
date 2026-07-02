@@ -17,7 +17,7 @@ wake <name|--dir DIR>` spawns a headless claude in that dir to join + reply.
 
 Pure stdlib; no deps.
 """
-import argparse, json, os, re, sys, time, uuid, subprocess, fcntl
+import argparse, json, os, re, sys, time, uuid, subprocess, fcntl, socket, shlex
 from datetime import datetime, timezone
 
 ROOT = os.path.join(os.path.expanduser("~"), ".claude", "agent-network")
@@ -26,10 +26,14 @@ LOCKS = os.path.join(ROOT, "locks")           # per-agent wake locks (single-wor
 AGENTS = os.path.join(ROOT, "agents.json")
 DIRNAMES = os.path.join(ROOT, "dir_names.json")
 LOG = os.path.join(ROOT, "log.jsonl")
+REMOTES = os.path.join(ROOT, "remotes.json")  # federation config — HUMAN-authored; the CLI ONLY reads it, never writes it
+OUTBOX = os.path.join(ROOT, "outbox")         # spool for pools we can't reach (they PULL via __drain-outbox)
 ONLINE_WINDOW_S = 90          # "online" = actively watching within this window
 WATCH_HEARTBEAT_EVERY_S = 5   # watch refreshes presence this often
 ACTIVELY_WATCHING_S = WATCH_HEARTBEAT_EVERY_S * 3  # ~15s. A live `watch` refreshes every 5s, so a heartbeat older than this means NOT actually watching (e.g. a headless agent that finished + exited leaves a stale-but-recent heartbeat). A send must then RE-WAKE rather than assume the msg is seen.
 MAX_DRAIN_ITERS = 25          # wake-worker shepherd: max claude runs in one drain-loop (safety cap against a worker that never empties its inbox)
+REMOTE_DRAIN_EVERY_S = 5      # `watch` pulls reachable remotes' outboxes (for THIS pool) at most this often
+REMOTE_SSH_TIMEOUT_S = 20     # per-hop ssh timeout for remote drain/ack/query (best-effort; a slow/down remote is skipped, never fatal)
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def now_ms(): return int(time.time() * 1000)
@@ -57,8 +61,53 @@ def _update_json(path, fn):
 
 def slug(s): return re.sub(r"[^a-z0-9_-]+", "-", s.lower()).strip("-") or "agent"
 
+def slug_addr(s):
+    """Slug a name, PRESERVING a single `pool:` qualifier: 'VPS:Were Gild' ->
+    'vps:were-gild', 'bob' -> 'bob'. The colon is federation's pool/agent separator."""
+    if ":" in s:
+        pool, agent = s.split(":", 1)
+        return f"{slug(pool)}:{slug(agent)}"
+    return slug(s)
+
+def parse_addr(s):
+    """('server:bob') -> ('server','bob'); ('bob') -> (None,'bob'). First colon splits."""
+    if ":" in s:
+        pool, agent = s.split(":", 1)
+        return slug(pool), slug(agent)
+    return None, slug(s)
+
+def qualify(pool, agent):
+    return f"{slug(pool)}:{slug(agent)}" if pool else slug(agent)
+
+def load_remotes():
+    """Federation config: HUMAN-authored remotes.json (the CLI NEVER writes it) + env
+    overrides. Returns {"self": <pool>, "remotes": {name: {ssh, reachable, ssh_opts, bin}}}.
+    Absent/empty -> {"self": <hostname slug>, "remotes": {}} -> legacy single-box behaviour.
+    A remote is 'reachable' iff it has an ssh target; one without (or reachable:false) is
+    'pull-only' — a spool destination we can't push to or wake."""
+    cfg = _load(REMOTES, {}) or {}
+    self_name = os.environ.get("AGENTNET_SELF") or cfg.get("self") or socket.gethostname()
+    remotes = {}
+    def add(name, ssh, reachable=None, ssh_opts="", binp="agentnet"):
+        ssh = (ssh or "").strip() or None
+        remotes[slug(name)] = {
+            "ssh": ssh,
+            "reachable": bool(ssh) if reachable is None else (bool(ssh) and reachable),
+            "ssh_opts": ssh_opts, "bin": binp,
+        }
+    for name, r in (cfg.get("remotes") or {}).items():
+        if isinstance(r, dict):
+            add(name, r.get("ssh"), r.get("reachable"), r.get("ssh_opts", ""), r.get("bin", "agentnet"))
+    env_r = os.environ.get("AGENTNET_REMOTES", "").strip()
+    if env_r:
+        for pair in env_r.split(","):
+            pair = pair.strip()
+            if "=" in pair:
+                n, s = pair.split("=", 1); add(n, s)
+    return {"self": slug(self_name), "remotes": remotes}
+
 def whoami():
-    if os.environ.get("AGENTNET_NAME"): return slug(os.environ["AGENTNET_NAME"])
+    if os.environ.get("AGENTNET_NAME"): return slug_addr(os.environ["AGENTNET_NAME"])
     cwd = os.getcwd()
     name = _load(DIRNAMES, {}).get(cwd)
     return name or slug(os.path.basename(cwd))
@@ -103,6 +152,53 @@ def deliver(to, msg):
     os.replace(tmp, os.path.join(p, fn))
     with open(LOG, "a") as f: f.write(json.dumps(msg) + "\n")
 
+def spool(dest_pool, msg):
+    """Queue a cross-pool message we can't push into outbox/<dest_pool>/ for that pool to
+    PULL (two-phase drain). Same atomic tmp->rename + {ts_ms}_{id} naming as deliver()."""
+    p = os.path.join(OUTBOX, dest_pool)
+    os.makedirs(os.path.join(p, ".drained"), exist_ok=True)
+    fn = f"{msg['ts_ms']:013d}_{msg['id'][:8]}.json"
+    tmp = os.path.join(p, ".drained", fn + ".tmp")
+    with open(tmp, "w") as f: json.dump(msg, f)
+    os.replace(tmp, os.path.join(p, fn))
+    with open(LOG, "a") as f: f.write(json.dumps(msg) + "\n")
+
+def _qual_self(cfg, me):
+    """The sender's pool-qualified name for a cross-pool message (so replies route home).
+    An already-qualified name (a remote push set AGENTNET_NAME=pool:agent) passes through."""
+    return me if ":" in me else f"{cfg['self']}:{me}"
+
+def _send_remote(cfg, pool, agent, me, a):
+    """Route a cross-pool send: PUSH over ssh to a reachable pool (its own CLI stamps
+    from + auto-wakes locally), or SPOOL to outbox/ for a pull-only pool to drain."""
+    r = cfg["remotes"].get(pool)
+    if not r:
+        print(f"send: unknown remote pool '{pool}' — `agentnet remotes` lists configured "
+              f"pools (remotes.json / AGENTNET_REMOTES).", file=sys.stderr); sys.exit(1)
+    frm = _qual_self(cfg, me)
+    if r["reachable"]:
+        argv = [r["bin"], "send", agent, a.body]
+        if a.reply_to: argv += ["--reply-to", a.reply_to]
+        if a.kind and a.kind != "msg": argv += ["--kind", a.kind]
+        if getattr(a, "no_wake", False): argv += ["--no-wake"]
+        # env-prefix (PATH so a non-interactive shell finds agentnet; AGENTNET_NAME so the
+        # far side stamps `from`) stays UNQUOTED for $HOME/$PATH expansion; args are quoted.
+        remote_cmd = ("PATH=$HOME/.local/bin:$PATH AGENTNET_NAME=" + shlex.quote(frm) + " "
+                      + " ".join(shlex.quote(x) for x in argv))
+        ssh_argv = ["ssh"] + shlex.split(r["ssh_opts"] or "") + [r["ssh"], remote_cmd]
+        res = subprocess.run(ssh_argv, text=True, capture_output=True)
+        if res.stdout: sys.stdout.write(res.stdout)
+        if res.stderr: sys.stderr.write(res.stderr)
+        if res.returncode != 0:
+            print(f"send: ssh push to '{pool}' ({r['ssh']}) failed (exit {res.returncode}).", file=sys.stderr)
+            sys.exit(1)
+        print(f"  ↳ pushed to {pool}:{agent} via ssh {r['ssh']}")
+    else:
+        mid = "msg_" + uuid.uuid4().hex[:12]
+        spool(pool, {"id": mid, "from": frm, "to": f"{pool}:{agent}", "ts": now_iso(),
+                     "ts_ms": now_ms(), "kind": a.kind, "reply_to": a.reply_to, "body": a.body})
+        print(f"sent {mid} -> {pool}:{agent} (spooled; '{pool}' is pull-only — drains on its next recv)")
+
 def pending(name):
     p = myinbox(name)
     files = sorted(fn for fn in os.listdir(p) if fn.endswith(".json"))
@@ -130,20 +226,57 @@ def cmd_register(a):
     print(f"registered '{name}'  dir={a.dir or os.getcwd()}")
 
 def cmd_agents(a):
-    d = _load(AGENTS, {})
-    if a.json: print(json.dumps(d, indent=2)); return
-    if not d: print("(no agents registered yet)"); return
-    for name, e in sorted(d.items()):
-        status = "online " if is_online(e) else "offline"
-        print(f"  {status}  {name:24}  {e.get('dir','?')}  (seen {e.get('last_seen','?')})")
+    local = _load(AGENTS, {})
+    allf = getattr(a, "all", False)
+    if a.json and not allf:
+        print(json.dumps(local, indent=2)); return
+    if not allf:
+        if not local: print("(no agents registered yet)"); return
+        for name, e in sorted(local.items()):
+            status = "online " if is_online(e) else "offline"
+            print(f"  {status}  {name:24}  {e.get('dir','?')}  (seen {e.get('last_seen','?')})")
+        return
+    # --all: federation-wide view — local agents prefixed `self:`, each reachable remote's
+    # agents queried over ssh and prefixed `<remote>:`. Pull-only pools aren't queryable.
+    cfg = load_remotes()
+    def show(prefix, d):
+        for name, e in sorted(d.items()):
+            status = "online " if is_online(e) else "offline"
+            print(f"  {status}  {prefix}:{name}")
+    show(cfg["self"], local)
+    for rname, r in sorted(cfg["remotes"].items()):
+        if not r["reachable"]:
+            print(f"  (pull-only  {rname}: not queryable)"); continue
+        try:
+            res = _ssh_run(r, _remote_agentnet(r, "agents", "--json"))
+            rd = json.loads(res.stdout) if res.returncode == 0 and res.stdout.strip() else {}
+        except Exception:
+            rd = {}
+        show(rname, rd)
+
+def cmd_remotes(a):
+    cfg = load_remotes()
+    print(f"self: {cfg['self']}")
+    rem = cfg["remotes"]
+    if not rem:
+        print("  (no remotes configured — single-box mode)"); return
+    for name, r in sorted(rem.items()):
+        if r["reachable"]:
+            print(f"  reachable  {name:16}  ssh={r['ssh']}")
+        else:
+            print(f"  pull-only  {name:16}  (spool only; not reachable/wakeable)")
 
 def cmd_send(a):
     me = whoami(); heartbeat(me)
+    cfg = load_remotes()
     broadcast = a.to in ("all", "*", "everyone")
-    if broadcast:
-        targets = [n for n in _load(AGENTS, {}) if n != me]   # broadcast excludes self
+    if not broadcast:
+        pool, agent = parse_addr(a.to)
+        if pool and pool != cfg["self"]:
+            return _send_remote(cfg, pool, agent, me, a)       # cross-pool: push or spool
+        targets = [agent]                                      # local (a `self:` prefix is stripped)
     else:
-        targets = [slug(a.to)]                                 # direct send (self allowed, e.g. tests)
+        targets = [n for n in _load(AGENTS, {}) if n != me]    # local broadcast (Phase 1: within-pool)
     if not targets:
         print(f"no target ('{a.to}' resolved to nothing — no other agents registered to broadcast to)", file=sys.stderr)
         sys.exit(1)
@@ -187,8 +320,69 @@ def _print_msg(m, as_json):
     rt = f" reply_to={m['reply_to']}" if m.get("reply_to") else ""
     print(f"[{m.get('kind','msg')}] {m['id']} from {m['from']}{rt} @ {m['ts']}\n  {m['body']}")
 
+def _has_id(name, mid):
+    """True if a message id is already in <name>'s inbox or .read (dedupe)."""
+    if not mid: return False
+    p = myinbox(name)
+    for d in (p, os.path.join(p, ".read")):
+        try:
+            for fn in os.listdir(d):
+                if fn.endswith(".json") and mid[:8] in fn:
+                    try:
+                        with open(os.path.join(d, fn)) as f:
+                            if json.load(f).get("id") == mid: return True
+                    except Exception: pass
+        except FileNotFoundError: pass
+    return False
+
+def _deposit_local(msg):
+    """Deposit a pulled cross-pool message into its TARGET agent's local inbox, idempotent
+    by id (so a re-drain before ack can't double-deliver). Returns True if newly stored."""
+    _, agent = parse_addr(msg.get("to", "") or "agent")
+    if _has_id(agent, msg.get("id")): return False
+    deliver(agent, msg)
+    return True
+
+def _ssh_run(r, remote_cmd):
+    argv = ["ssh"] + shlex.split(r["ssh_opts"] or "") + [r["ssh"], remote_cmd]
+    return subprocess.run(argv, text=True, capture_output=True, timeout=REMOTE_SSH_TIMEOUT_S)
+
+def _remote_agentnet(r, *verb_args):
+    return (f"PATH=$HOME/.local/bin:$PATH {shlex.quote(r['bin'])} "
+            + " ".join(shlex.quote(x) for x in verb_args))
+
+def drain_remotes(cfg):
+    """Pull messages spooled for THIS pool on each reachable remote, deposit each into its
+    target agent's local inbox (dedupe), then ack exactly what we saw (two-phase: no loss,
+    no dupes). Best-effort: a down/erroring remote is skipped with a warning, never fatal.
+    Whoever calls this drains the WHOLE pool outbox and fans messages out to local inboxes;
+    each agent then reads only its own."""
+    self_pool = cfg["self"]; got = 0
+    for name, r in cfg["remotes"].items():
+        if not r["reachable"]: continue
+        try:
+            res = _ssh_run(r, _remote_agentnet(r, "__drain-outbox", self_pool))
+        except Exception as e:
+            print(f"  ↳ drain '{name}' skipped: {e}", file=sys.stderr); continue
+        if res.returncode != 0:
+            print(f"  ↳ drain '{name}' skipped (ssh exit {res.returncode})", file=sys.stderr); continue
+        seen = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line: continue
+            try: msg = json.loads(line)
+            except Exception: continue
+            if _deposit_local(msg): got += 1
+            if msg.get("id"): seen.append(msg["id"])
+        if seen:
+            try: _ssh_run(r, _remote_agentnet(r, "__ack-drain", self_pool, *seen))
+            except Exception: pass
+    return got
+
 def cmd_recv(a):
     me = whoami(); heartbeat(me)
+    cfg = load_remotes()
+    if cfg["remotes"]: drain_remotes(cfg)   # pull cross-pool messages spooled for us
     msgs = pending(me)
     if not msgs:
         print("(no new messages)" if not a.json else "[]"); return
@@ -201,11 +395,17 @@ def cmd_recv(a):
 def cmd_watch(a):
     """Emit one stdout line per inbound message, forever. Run under the Monitor tool."""
     me = whoami()
+    cfg = load_remotes()
     print(f"[agentnet] {me} watching for messages... (run under Monitor)", flush=True)
-    last_hb = 0.0
+    last_hb = 0.0; last_drain = 0.0
     while True:
-        if time.time() - last_hb > WATCH_HEARTBEAT_EVERY_S:
-            heartbeat(me); last_hb = time.time()
+        now = time.time()
+        if now - last_hb > WATCH_HEARTBEAT_EVERY_S:
+            heartbeat(me); last_hb = now
+        if cfg["remotes"] and now - last_drain > REMOTE_DRAIN_EVERY_S:
+            try: drain_remotes(cfg)   # pull cross-pool messages spooled for us
+            except Exception: pass
+            last_drain = now
         for fn, m in pending(me):
             body = " ".join(str(m.get("body", "")).splitlines())
             rt = f" reply_to={m['reply_to']}" if m.get("reply_to") else ""
@@ -278,6 +478,51 @@ def _wake(name, dir_, message, quiet=False, listen=False):
     if not quiet:
         print(f"woke '{name}' in {d} (single-worker headless claude, log: {os.path.join(ROOT, f'woke_{name}.log')})")
 
+def _outbox_dir(pool):
+    p = os.path.join(OUTBOX, pool)
+    os.makedirs(os.path.join(p, ".drained"), exist_ok=True)
+    return p
+
+def cmd_drain_outbox(a):
+    """Phase 1 of the two-phase pull (internal transport verb): PRINT — one JSON per line —
+    the messages spooled for <pool>, WITHOUT removing them. Snapshot under an exclusive lock
+    so a message written mid-drain waits for the next drain (never half-read). The caller
+    deposits locally + fsync, then calls `__ack-drain` to archive exactly what it stored —
+    at-least-once + inbox dedupe = no loss, no dupes."""
+    pool = slug(a.pool)
+    p = _outbox_dir(pool)
+    with open(os.path.join(OUTBOX, pool + ".lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        files = sorted(fn for fn in os.listdir(p) if fn.endswith(".json"))
+        out = []
+        for fn in files:
+            try:
+                with open(os.path.join(p, fn)) as f: out.append(json.load(f))
+            except Exception: pass
+        fcntl.flock(lf, fcntl.LOCK_UN)
+    for m in out:
+        print(json.dumps(m))
+
+def cmd_ack_drain(a):
+    """Phase 2 (internal): archive (move to .drained/) exactly the message ids the caller
+    confirms it stored. Ids not present are ignored (already archived / never existed)."""
+    pool = slug(a.pool)
+    p = _outbox_dir(pool)
+    want = set(a.ids)
+    moved = 0
+    with open(os.path.join(OUTBOX, pool + ".lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        for fn in list(os.listdir(p)):
+            if not fn.endswith(".json"): continue
+            try:
+                with open(os.path.join(p, fn)) as f: mid = json.load(f).get("id")
+            except Exception: continue
+            if mid in want:
+                try: os.replace(os.path.join(p, fn), os.path.join(p, ".drained", fn)); moved += 1
+                except FileNotFoundError: pass
+        fcntl.flock(lf, fcntl.LOCK_UN)
+    print(f"acked {moved}")
+
 def cmd_wake_worker(a):
     """Internal shepherd (not a user verb): holds a per-agent flock so only ONE
     runs per agent, then loops `claude -p` until the agent's inbox is drained."""
@@ -329,7 +574,9 @@ def main():
 
     sp = sub.add_parser("register"); sp.add_argument("name", nargs="?"); sp.add_argument("--dir"); sp.set_defaults(func=cmd_register)
 
-    sp = sub.add_parser("agents"); sp.add_argument("--json", action="store_true"); sp.set_defaults(func=cmd_agents)
+    sp = sub.add_parser("agents"); sp.add_argument("--json", action="store_true"); sp.add_argument("--all", action="store_true"); sp.set_defaults(func=cmd_agents)
+
+    sub.add_parser("remotes").set_defaults(func=cmd_remotes)
 
     sp = sub.add_parser("send"); sp.add_argument("to"); sp.add_argument("body")
     sp.add_argument("--reply-to", dest="reply_to"); sp.add_argument("--kind", default="msg")
@@ -352,6 +599,10 @@ def main():
     sp.add_argument("name"); sp.add_argument("--dir"); sp.add_argument("--by")
     sp.add_argument("--message"); sp.add_argument("--listen", action="store_true")
     sp.set_defaults(func=cmd_wake_worker)
+
+    # internal transport verbs (prefix `__` = not user-facing): the two-phase outbox pull.
+    sp = sub.add_parser("__drain-outbox"); sp.add_argument("pool"); sp.set_defaults(func=cmd_drain_outbox)
+    sp = sub.add_parser("__ack-drain"); sp.add_argument("pool"); sp.add_argument("ids", nargs="*"); sp.set_defaults(func=cmd_ack_drain)
 
     a = p.parse_args()
     a.func(a)
