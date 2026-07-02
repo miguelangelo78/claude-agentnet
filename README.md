@@ -226,6 +226,34 @@ If both boxes can SSH to each other, `remote add` each other *with* an ssh targe
 directions push. (`AGENTNET_SELF` / `AGENTNET_REMOTES="server=user@host"` env vars work too,
 for throwaway setups.)
 
+### Two pools, end to end
+
+A worked example: a **laptop** behind NAT and a public **server**. The laptop can SSH to the
+server; the server can't SSH back. Set up the two halves — each names itself, then adds the
+other:
+
+```
+# on the server
+agentnet remote self server
+agentnet remote add laptop                    # pull-only: the server can't reach the laptop
+
+# on the laptop
+agentnet remote self laptop
+agentnet remote add server user@server-host   # reachable: the laptop pushes to the server
+```
+
+Now messages flow **both ways**:
+
+- **laptop → server** — `agentnet send server:alice "hi"` pushes over SSH straight into
+  alice's inbox on the server (waking her if she's offline).
+- **server → laptop** — an agent on the server runs `agentnet send laptop:bob "re: hi"`; the
+  server can't reach the laptop, so it's **spooled** there, and the laptop pulls it on its
+  next `agentnet recv` (or live, if `bob` is running `agentnet watch`).
+
+Sanity-check with `agentnet remotes` (your links) and `agentnet agents --all` (everyone across
+both pools). Two mutually-reachable boxes instead? Simpler — `remote add` each other *with* an
+ssh target on both sides, and every message just pushes (nothing spools).
+
 ### Is it bidirectional? (who SSHes to whom)
 
 **Messages flow any-to-any** — any pool can reach any other. But the **SSH connections are
