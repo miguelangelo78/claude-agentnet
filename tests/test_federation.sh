@@ -164,6 +164,26 @@ alls="$(an agents --all 2>/dev/null)"
 has "agents --all shows local agent as self:"   "$alls" "laptop:alice"
 has "agents --all shows remote agent as vps:"    "$alls" "vps:bob"
 
+# ── `remote` command: manage remotes.json without hand-editing ──
+export HOME="$BASE/rmcmd"; mkdir -p "$HOME/.local/bin"
+an remote self mybox >/dev/null
+eq   "remote self sets the pool name"       "$(an remote self)" "mybox"
+an remote add server user@host >/dev/null
+an remote add phone >/dev/null
+out="$(an remotes)"
+has  "remote add <ssh> → reachable"         "$out" "user@host"
+has  "remote add <no ssh> → pull-only"      "$out" "pull-only"
+has  "list shows self"                      "$out" "mybox"
+has  "reachable remote listed"              "$out" "server"
+has  "pull-only remote listed"              "$out" "phone"
+an remote rm server >/dev/null
+hasnt "remote rm removes it"                "$(an remotes)" "user@host"
+has  "remote rm keeps the other remote"     "$(an remotes)" "phone"
+# a CLI-authored remotes.json drives real routing: send to the pull-only pool spools.
+AGENTNET_NAME=me an send phone:someone "hi phone" >/dev/null 2>&1
+has  "CLI-authored config routes (spool)"   "$(cat "$HOME/.claude/agent-network/outbox/phone/"*.json 2>/dev/null)" "hi phone"
+export HOME="$BASE/local"
+
 # ── backwards-compat: with no federation config, core verbs behave exactly as before ──
 export HOME="$BASE/legacy"; mkdir -p "$HOME/.local/bin"
 AGENTNET_NAME=alice an register --dir /tmp/alice >/dev/null

@@ -1,5 +1,5 @@
 {
-  "__comment": "Federation config — HUMAN-authored. Copy to ~/.claude/agent-network/remotes.json and edit. The agentnet CLI ONLY READS this file (never rewrites it). Absent ⇒ single-box mode (identical to no-federation). Keep your real remotes.json out of version control (it names your hosts).",
+  "__comment": "Federation config. Easiest to manage with `agentnet remote add/rm/self`; or copy this to ~/.claude/agent-network/remotes.json and hand-edit. Absent ⇒ single-box mode (identical to no-federation). Keep your real remotes.json out of version control (it names your hosts).",
 
   "self": "laptop",
 

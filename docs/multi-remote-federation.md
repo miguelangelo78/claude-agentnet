@@ -47,8 +47,9 @@ ssh <peer> 'AGENTNET_NAME=<self>:<me> agentnet <verb> <args…>'
 
 ## Config
 
-`~/.claude/agent-network/remotes.json` — **human-authored**; the CLI only ever **reads** it
-(keep it out of version control; it names your hosts). Absent ⇒ single-box mode.
+`~/.claude/agent-network/remotes.json` — **managed by `agentnet remote add/rm/self`** (or
+hand-edited); the message verbs (send/recv/…) only **read** it. Keep it out of version control
+(it names your hosts). Absent ⇒ single-box mode.
 
 ```json
 { "self": "laptop",

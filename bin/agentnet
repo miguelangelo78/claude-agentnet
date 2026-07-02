@@ -266,6 +266,56 @@ def cmd_remotes(a):
         else:
             print(f"  pull-only  {name:16}  (spool only; not reachable/wakeable)")
 
+def _load_remotes_raw():
+    """The raw remotes.json for EDITING (preserves `self` + any hand-added fields). {} if absent."""
+    return _load(REMOTES, {}) or {}
+
+def _write_remotes_raw(d):
+    d.setdefault("_comment", "Managed by `agentnet remote add/rm/self` (also hand-editable). "
+                             "Keep out of version control — it names your hosts.")
+    ensure_dirs()
+    tmp = REMOTES + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, REMOTES)
+
+def _ensure_self(d):
+    if not d.get("self"):
+        d["self"] = slug(os.environ.get("AGENTNET_SELF") or socket.gethostname())
+    d.setdefault("remotes", {})
+    return d
+
+def cmd_remote_add(a):
+    """Add/update a remote in remotes.json. With an ssh target it's REACHABLE (you push);
+    without one it's PULL-ONLY (it pulls from you — e.g. it's behind NAT)."""
+    d = _ensure_self(_load_remotes_raw())
+    name = slug(a.name)
+    entry = d["remotes"].get(name, {})
+    if a.ssh:
+        entry["ssh"] = a.ssh; entry.pop("reachable", None)
+        d["remotes"][name] = entry; _write_remotes_raw(d)
+        print(f"added remote '{name}' — reachable (you push over ssh {a.ssh}). self={d['self']}")
+    else:
+        entry.pop("ssh", None); entry["reachable"] = False
+        d["remotes"][name] = entry; _write_remotes_raw(d)
+        print(f"added remote '{name}' — pull-only (it pulls from you; you can't push or wake it). self={d['self']}")
+
+def cmd_remote_rm(a):
+    d = _load_remotes_raw()
+    name = slug(a.name)
+    if name in d.get("remotes", {}):
+        del d["remotes"][name]; _write_remotes_raw(d)
+        print(f"removed remote '{name}'")
+    else:
+        print(f"no such remote '{name}' — `agentnet remotes` lists them", file=sys.stderr); sys.exit(1)
+
+def cmd_remote_self(a):
+    """Get (no arg) or set your own pool name — used to qualify your `from` across pools."""
+    if a.name:
+        d = _ensure_self(_load_remotes_raw()); d["self"] = slug(a.name); _write_remotes_raw(d)
+        print(f"self = {d['self']}")
+    else:
+        print(load_remotes()["self"])
+
 def cmd_send(a):
     me = whoami(); heartbeat(me)
     cfg = load_remotes()
@@ -576,7 +626,14 @@ def main():
 
     sp = sub.add_parser("agents"); sp.add_argument("--json", action="store_true"); sp.add_argument("--all", action="store_true"); sp.set_defaults(func=cmd_agents)
 
-    sub.add_parser("remotes").set_defaults(func=cmd_remotes)
+    sub.add_parser("remotes").set_defaults(func=cmd_remotes)   # alias for `remote list`
+
+    rp = sub.add_parser("remote"); rp.set_defaults(func=cmd_remotes)   # bare `remote` -> list
+    rsub = rp.add_subparsers(dest="rcmd")
+    rsub.add_parser("list").set_defaults(func=cmd_remotes)
+    _ra = rsub.add_parser("add"); _ra.add_argument("name"); _ra.add_argument("ssh", nargs="?"); _ra.set_defaults(func=cmd_remote_add)
+    _rx = rsub.add_parser("rm"); _rx.add_argument("name"); _rx.set_defaults(func=cmd_remote_rm)
+    _rs = rsub.add_parser("self"); _rs.add_argument("name", nargs="?"); _rs.set_defaults(func=cmd_remote_self)
 
     sp = sub.add_parser("send"); sp.add_argument("to"); sp.add_argument("body")
     sp.add_argument("--reply-to", dest="reply_to"); sp.add_argument("--kind", default="msg")

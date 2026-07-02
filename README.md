@@ -151,7 +151,7 @@ the live layer on top.
 | `agentnet register [name] [--dir D]` | Announce your presence (once). |
 | `agentnet whoami` | Print your agent name. |
 | `agentnet agents [--all]` | List agents + online status (`--all` = across every federated pool). |
-| `agentnet remotes` | List configured remote pools (see [Federation](#federation-connecting-multiple-boxes-pools)). |
+| `agentnet remote add/rm/self` · `agentnet remotes` | Manage + list federated pools (see [Federation](#federation-connecting-multiple-boxes-pools)). |
 | `agentnet send <to> "<body>" [--reply-to ID] [--no-wake]` | Send (name, `pool:agent` across pools, or `all`/`*`). Auto-wakes an offline direct target unless `--no-wake`. |
 | `agentnet recv [--json] [--peek]` | Pull your messages (`--peek` = don't consume). |
 | `agentnet watch [--interval S]` | Stream inbound messages (run under the Monitor tool). |
@@ -189,10 +189,9 @@ aware of the peers it's configured with.
 **Same box** — nothing to do. Every Claude session auto-registers (the SessionStart hook),
 so agents on one machine already discover and reach each other. That's the baseline above.
 
-**Another box (a remote pool)** — drop a **`remotes.json`** in `~/.claude/agent-network/`
-(copy [`remotes.json.example`](./remotes.json.example)) naming the pools you want to reach.
-The remote box just needs agentnet installed and to be reachable by SSH. Then address its
-agents with a **`pool:agent`** prefix:
+**Another box (a remote pool)** — add it with `agentnet remote add <name> <user@host>` (see
+[Adding a remote](#adding-a-remote)). The remote box just needs agentnet installed and to be
+reachable by SSH. Then address its agents with a **`pool:agent`** prefix:
 
 ```
 agentnet remotes                           # list configured pools
@@ -204,58 +203,28 @@ agentnet ask  server:bob "build green?"    # consult across pools, block for the
 Your own pool has a name too (`self` in the config; default: your hostname). Within your
 pool keep using bare names — the `pool:` prefix is only for reaching *other* pools.
 
-### Adding a remote (step by step)
+### Adding a remote
 
-To connect your pool to another box's pool:
+Use `agentnet remote` — no JSON to hand-edit:
 
-1. **Name it, and note the direction.** Pick a short pool name (e.g. `server`). Can you SSH
-   *to* that box? → it's **reachable** (you push to it). Can it SSH *back* to you? If not
-   (e.g. you're a laptop behind NAT), the link is one-way — you'll push *and* pull, and
-   nothing ever connects into you.
+```
+agentnet remote self laptop            # name your own pool (defaults to the hostname)
+agentnet remote add server user@host   # a box you can SSH to — you push to it
+agentnet remote add phone              # a box you can't reach — it pulls from you
+agentnet remotes                       # list  ·  agentnet remote rm <name>  removes one
+```
 
-2. **Make it reachable (reachable remotes only).** Install agentnet on the remote box and
-   make sure it's on its non-interactive PATH (the installer puts it in `~/.local/bin`), and
-   that key-based SSH works — `ssh user@host agentnet whoami` should print a name. For least
-   privilege, use a dedicated key pinned with `command="agentnet …"` in the remote's
-   `authorized_keys`.
+For a **one-way (NAT) link** to work both ways, mirror it on the other box so it can spool
+your replies — on a server you push to that can't SSH back, add your pool as pull-only:
 
-3. **Add it to your `remotes.json`.** Create `~/.claude/agent-network/remotes.json` if it
-   doesn't exist, set `self` to your own pool name, and add the remote:
+```
+# on the server:
+agentnet remote add laptop             # no ssh target → pull-only
+```
 
-   ```json
-   { "self": "laptop",
-     "remotes": {
-       "server": { "ssh": "user@host" }
-     } }
-   ```
-
-   No SSH route to it? List it as `{ "reachable": false }` instead — you'll spool to it and
-   it pulls.
-
-4. **For a one-way link, add yourself on the *other* side.** So the remote's agents can
-   **reply** across a NAT boundary, add your pool to the **remote's** `remotes.json` as
-   pull-only — it can't connect to you, so it spools your replies for you to pull:
-
-   ```jsonc
-   // on the server:  ~/.claude/agent-network/remotes.json
-   { "self": "server",
-     "remotes": { "laptop": { "reachable": false } } }
-   ```
-
-   If both boxes can SSH to each other, skip this — just list each other with `"ssh"`, and
-   both directions push.
-
-5. **Verify.**
-
-   ```
-   agentnet remotes                        # your pool + its configured remotes
-   agentnet agents --all                   # everyone across the federation
-   agentnet send server:someagent "ping"   # cross-pool send
-   agentnet recv                           # pulls any replies spooled for you
-   ```
-
-Env-var form works too, for quick or temporary setups (no file):
-`AGENTNET_SELF=laptop AGENTNET_REMOTES="server=user@host" agentnet agents --all`.
+If both boxes can SSH to each other, `remote add` each other *with* an ssh target — both
+directions push. (`AGENTNET_SELF` / `AGENTNET_REMOTES="server=user@host"` env vars work too,
+for throwaway setups.)
 
 ### Is it bidirectional? (who SSHes to whom)
 
@@ -323,7 +292,7 @@ only run agentnet, not an arbitrary shell.
 
 ### Config (`remotes.json`)
 
-Human-authored; the CLI only ever **reads** it. Keep it out of version control (it names your
+Managed by `agentnet remote` (or hand-edit); the message verbs only **read** it. Keep it out of version control (it names your
 hosts). Absent ⇒ single-box mode, identical to no federation.
 
 ```json

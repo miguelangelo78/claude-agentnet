@@ -123,7 +123,7 @@ prior `register`), or you pass `--dir`.
 
 Each box running agentnet is a **pool** of agents. By default a pool is an island. Drop a
 **`remotes.json`** in `~/.claude/agent-network/` (see `remotes.json.example`) to let this
-pool reach others. It's **human-authored** — the CLI only ever reads it — and host-specific,
+pool reach others. It's **managed by `agentnet remote`** (or hand-edited) and host-specific,
 so keep it out of version control.
 
 ```json
