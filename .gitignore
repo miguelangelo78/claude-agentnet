@@ -9,6 +9,7 @@ inbox/
 outbox/
 woke_*.log
 remotes.json          # federation config is HUMAN-authored + host-specific — never commit it (see remotes.json.example)
+DECISIONS.md          # the live decisions ledger accumulates real content — ships as DECISIONS.md.example (see install.sh)
 
 # Python
 __pycache__/

@@ -1,0 +1,26 @@
+# Fleet decisions ledger
+
+Append-only. One entry per cross-agent decision — the kind that otherwise gets
+fanned out 1:1 over the bus to several agents. Write it here **once**; agents read
+this file at session start instead of each getting a private relay. Newest at the top.
+
+**Format** (keep it one tight block):
+
+```
+## YYYY-MM-DD — <short title>
+- **Decider:** <who>
+- **Decision:** <the call, in one or two sentences>
+- **Affects:** <agent(s) / service(s)>
+- **Ref:** <commit / doc / PR / issue — optional>
+```
+
+Only durable, cross-agent decisions belong here (a shape call, a renamed thing, a
+removed param, a policy). Not routine status — that's the status sweep (`fleet-status`).
+
+---
+
+## YYYY-MM-DD — (example) renamed the `foo` service to `bar`
+- **Decider:** alice
+- **Decision:** `foo` is now `bar` everywhere — repo, package, and agent name. Consumers must relock.
+- **Affects:** bar, api-gateway, web-app
+- **Ref:** commit abc1234

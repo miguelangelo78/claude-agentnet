@@ -106,11 +106,29 @@ def load_remotes():
                 n, s = pair.split("=", 1); add(n, s)
     return {"self": slug(self_name), "remotes": remotes}
 
+# Broad shared parents an agent must NEVER inherit an identity from: a cwd under
+# one of these with no pin of its own is a genuinely NEW agent (keep its basename),
+# not a subdir of an existing one. Keeps the ancestor-walk below from routing e.g.
+# ~/claude/newthing to whatever ~/claude happens to be pinned to.
+_NOINHERIT = {os.path.realpath(os.path.expanduser(p)) for p in
+              ("~", "~/claude", "~/DEV", "~/.claude", "~/.claude/agent-network")}
+
 def whoami():
     if os.environ.get("AGENTNET_NAME"): return slug_addr(os.environ["AGENTNET_NAME"])
+    dn = _load(DIRNAMES, {})
     cwd = os.getcwd()
-    name = _load(DIRNAMES, {}).get(cwd)
-    return name or slug(os.path.basename(cwd))
+    if cwd in dn: return dn[cwd]                       # exact pin — unchanged behaviour
+    # Inherit the nearest ANCESTOR pin, so `cd`-ing into a subdir of a registered
+    # agent keeps that agent's name instead of spawning a basename phantom
+    # (dumps/poc/oracle/src/scratchpad were all this). Stop before the broad shared
+    # parents so a brand-new agent at ~/claude/<x> still gets its own name.
+    d = os.path.dirname(os.path.realpath(cwd))
+    while d and d not in _NOINHERIT:
+        if d in dn: return dn[d]
+        nd = os.path.dirname(d)
+        if nd == d: break
+        d = nd
+    return slug(os.path.basename(cwd))                # unchanged fallback
 
 def heartbeat(name, dir_=None):
     def fn(d):
@@ -197,7 +215,10 @@ def _send_remote(cfg, pool, agent, me, a):
         mid = "msg_" + uuid.uuid4().hex[:12]
         spool(pool, {"id": mid, "from": frm, "to": f"{pool}:{agent}", "ts": now_iso(),
                      "ts_ms": now_ms(), "kind": a.kind, "reply_to": a.reply_to, "body": a.body})
-        print(f"sent {mid} -> {pool}:{agent} (spooled; '{pool}' is pull-only — drains on its next recv)")
+        print(f"⚠️  '{pool}' is currently UNREACHABLE (pull-only) — {mid} was SPOOLED to "
+              f"{pool}:{agent}, NOT delivered live. It arrives only when '{pool}' next pulls "
+              f"(its watcher/recv). If you need an answer now, '{pool}' is not listening.",
+              file=sys.stderr)
 
 def pending(name):
     p = myinbox(name)
@@ -365,6 +386,41 @@ def cmd_send(a):
     _wake(t, d, None, quiet=True)
     print(f"  ↳ '{t}' was offline — woke it (a SINGLE headless worker drains ALL queued messages; concurrent/repeat wakes coalesce into it, never duplicate instances).", file=sys.stderr)
 
+def _find_msg_by_id(name, mid):
+    """Locate a message in <name>'s inbox or .read by full id OR 8-char prefix
+    (agents usually see the short prefix in `recv`/`watch` output)."""
+    p = myinbox(name)
+    for d in (p, os.path.join(p, ".read")):
+        try: files = sorted(os.listdir(d), reverse=True)
+        except FileNotFoundError: continue
+        for fn in files:
+            if not fn.endswith(".json"): continue
+            try:
+                with open(os.path.join(d, fn)) as f: m = json.load(f)
+            except Exception: continue
+            if m.get("id") == mid or str(m.get("id", "")).startswith(mid):
+                return m
+    return None
+
+def cmd_reply(a):
+    """Reply to a message by id — auto-routes to its ORIGINAL sender with
+    --reply-to set. Threads pair up in the audit log AND you can't misfire the
+    reply into your own inbox (the #1 dropped-reply footgun). Cross-pool senders
+    route home automatically. Usage: `agentnet reply <id> "<body>"`."""
+    me = whoami(); heartbeat(me)
+    m = _find_msg_by_id(me, a.id)
+    if not m:
+        print(f"reply: no message matching '{a.id}' in your inbox or .read — "
+              f"`agentnet recv --peek` lists ids.", file=sys.stderr); sys.exit(1)
+    sender = m.get("from")
+    if not sender or sender == me:
+        print(f"reply: message '{a.id}' has no other sender to reply to (from={sender}).",
+              file=sys.stderr); sys.exit(1)
+    class _A: pass
+    sa = _A(); sa.to = sender; sa.body = a.body
+    sa.reply_to = m.get("id"); sa.kind = "reply"; sa.no_wake = False
+    cmd_send(sa)   # reuse the full send path: local + cross-pool routing, auto-wake, self-send guard
+
 def _print_msg(m, as_json):
     if as_json: print(json.dumps(m)); return
     rt = f" reply_to={m['reply_to']}" if m.get("reply_to") else ""
@@ -465,18 +521,36 @@ def cmd_watch(a):
 
 def cmd_ask(a):
     me = whoami(); heartbeat(me)
-    target = slug(a.to)
+    cfg = load_remotes()
+    pool, agent = parse_addr(a.to)
+    remote = bool(pool and pool != cfg["self"])
+    target = qualify(pool, agent) if remote else agent   # "laptop:odin" (remote) or "odin" (local)
     mid = "msg_" + uuid.uuid4().hex[:12]
     # Queue the question FIRST so a freshly-woken agent finds it on `recv`
     # (waking before delivering races: it could recv an empty inbox and exit).
-    deliver(target, {"id": mid, "from": me, "to": target, "ts": now_iso(), "ts_ms": now_ms(),
-                     "kind": "ask", "reply_to": None, "body": a.question})
-    entry = _load(AGENTS, {}).get(target)
-    if a.dir or a.wake or not (entry and is_online(entry)):
-        _wake(target, dir_=a.dir, message=None, quiet=True)
-    print(f"asked {target}: {a.question}\nwaiting up to {a.timeout}s for a reply (reply_to={mid})...", flush=True)
+    if remote:
+        # Route the question cross-pool EXACTLY like `send` — push to a reachable
+        # pool (its CLI delivers + auto-wakes locally) or spool to a pull-only one.
+        # (Old bug: slug("laptop:odin") -> a local "laptop-odin" phantom inbox that
+        # nobody reads, so a remote ask never reached the target.) The far side
+        # stamps its own message id, so we match the reply by `from == target` below.
+        class _A: pass
+        sa = _A(); sa.to = a.to; sa.body = a.question
+        sa.reply_to = None; sa.kind = "ask"; sa.no_wake = False
+        _send_remote(cfg, pool, agent, me, sa)
+    else:
+        deliver(target, {"id": mid, "from": me, "to": target, "ts": now_iso(), "ts_ms": now_ms(),
+                         "kind": "ask", "reply_to": None, "body": a.question})
+        entry = _load(AGENTS, {}).get(target)
+        if a.dir or a.wake or not (entry and is_online(entry)):
+            _wake(target, dir_=a.dir, message=None, quiet=True)
+    hint = "" if remote else f" (reply_to={mid})"
+    print(f"asked {target}: {a.question}\nwaiting up to {a.timeout}s for a reply{hint}...", flush=True)
     deadline = time.time() + a.timeout
     while time.time() < deadline:
+        if cfg["remotes"]:
+            try: drain_remotes(cfg)     # pull a cross-pool reply spooled for us on a reachable remote
+            except Exception: pass
         for fn, m in pending(me):
             # the reply = explicit reply_to, or simply the next message back from the target
             if m.get("reply_to") == mid or m.get("from") == target:
@@ -490,11 +564,11 @@ def _wake_prompt(name, me, message, listen):
         f"Another agent ('{me}') needs you. FIRST run `agentnet register {name}` then "
         f"`agentnet recv` to read the message(s) addressed to you. Act on them as an ADVISOR: "
         f"answer/investigate within THIS directory, and REPLY by running "
-        f"`agentnet send <SENDER> \"<your reply>\" --reply-to <the message id>`, where "
-        f"<SENDER> is the `from` field of the message you are answering (shown by "
-        f"`agentnet recv`). For the message that woke you, <SENDER> is '{me}'. "
-        f"NEVER send to your OWN name ('{name}') — that drops the reply in your own "
-        f"inbox and the sender never sees it. "
+        f"`agentnet reply <message-id> \"<your reply>\"` — it auto-routes to the "
+        f"original sender with the thread paired; get the id from `agentnet recv`. "
+        f"(Equivalent longhand: `agentnet send <SENDER> \"...\" --reply-to <id>`, where "
+        f"<SENDER> is the message's `from` — for the message that woke you it is '{me}'. "
+        f"NEVER send to your OWN name ('{name}') — that drops the reply in your own inbox.) "
         f"Do NOT make code changes, commits, deploys, or any irreversible/outward-facing action "
         f"unless the message explicitly asks AND your own CLAUDE.md/safety rules allow it — when unsure, "
         f"reply asking for confirmation instead. The protocol is in ~/.claude/agent-network/README.md. "
@@ -639,6 +713,8 @@ def main():
     sp.add_argument("--reply-to", dest="reply_to"); sp.add_argument("--kind", default="msg")
     sp.add_argument("--no-wake", dest="no_wake", action="store_true", help="just queue; do NOT auto-wake an offline target")
     sp.set_defaults(func=cmd_send)
+
+    sp = sub.add_parser("reply"); sp.add_argument("id"); sp.add_argument("body"); sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("recv"); sp.add_argument("--json", action="store_true"); sp.add_argument("--peek", action="store_true"); sp.set_defaults(func=cmd_recv)
 

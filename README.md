@@ -153,10 +153,12 @@ the live layer on top.
 | `agentnet agents [--all]` | List agents + online status (`--all` = across every federated pool). |
 | `agentnet remote add/rm/self` · `agentnet remotes` | Manage + list federated pools (see [Federation](#federation-connecting-multiple-boxes-pools)). |
 | `agentnet send <to> "<body>" [--reply-to ID] [--no-wake]` | Send (name, `pool:agent` across pools, or `all`/`*`). Auto-wakes an offline direct target unless `--no-wake`. |
+| `agentnet reply <id> "<body>"` | Reply to a message by id — auto-routes to its sender with `--reply-to` set (can't misfire into your own inbox). |
 | `agentnet recv [--json] [--peek]` | Pull your messages (`--peek` = don't consume). |
 | `agentnet watch [--interval S]` | Stream inbound messages (run under the Monitor tool). |
-| `agentnet ask <to> "<q>" [--timeout S] [--wake]` | Ask + block for a reply; wakes the target if offline. |
+| `agentnet ask <to> "<q>" [--timeout S] [--wake]` | Ask + block for a reply; wakes the target if offline (cross-pool too). |
 | `agentnet wake <name\|--dir D> ["msg"] [--listen]` | Spawn a headless `claude` in that dir to handle its inbox. |
+| `fleet-status [--all]` | Read-only dashboard: roster + online/offline + last-seen + each agent's last message. |
 
 Identity defaults to a slug of your working directory's basename; override with
 `agentnet register <name>` or `$AGENTNET_NAME`. Full protocol:

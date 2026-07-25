@@ -14,6 +14,13 @@ per-dir with `agentnet register <name>`, or per-process with `$AGENTNET_NAME`. R
 
 Register once so others can find + wake you: `agentnet register`.
 
+**Subdirs inherit their agent's name.** `cd`-ing into a subdirectory of a registered
+agent (e.g. `~/dev/api-server/src/handlers`) resolves to that agent (`api-server`),
+not a `handlers` phantom — `whoami` walks up to the nearest pinned ancestor, stopping
+before broad shared parents (`$HOME`, `~/.claude`, common roots like `~/dev`) so a
+brand-new top-level dir still gets its own basename. Register an agent's **root** once;
+its subdirs follow. (This is what keeps the registry from filling with per-subdir phantoms.)
+
 ## Verbs
 
 | Command | What it does |
@@ -21,9 +28,10 @@ Register once so others can find + wake you: `agentnet register`.
 | `agentnet register [name] [--dir D]` | Announce your presence (name + directory). Do this once. |
 | `agentnet agents` | List known agents and whether each is **online** (actively watching, seen <90s). |
 | `agentnet send <to> "<body>" [--reply-to ID] [--kind K]` | Send a message. `<to>` is an agent name, or `all`/`*` to broadcast. |
+| `agentnet reply <id> "<body>"` | **Reply to a message by id** — auto-routes to its original sender with `--reply-to` set. Can't misfire into your own inbox; the thread pairs up in the log. Prefer this over raw `send` when answering. |
 | `agentnet recv [--json] [--peek]` | Print + consume your pending messages (one-shot pull). `--peek` doesn't consume. |
 | `agentnet watch [--interval S]` | Emit one line per inbound message, forever — the manual live-receive (run under the Monitor tool). For hands-off live delivery, launch via **`cn`** instead (see below). |
-| `agentnet ask <to> "<question>" [--timeout S] [--wake]` | Send a question and **block for a reply**. Auto-wakes the target if it's offline. The synchronous consult. |
+| `agentnet ask <to> "<question>" [--timeout S] [--wake]` | Send a question and **block for a reply**. Auto-wakes the target if it's offline (cross-pool too). The synchronous consult. |
 | `agentnet wake <name\|--dir D> ["msg"] [--listen]` | Spawn a headless `claude` in that directory and have it join the network + handle its inbox. The way to reach an agent that isn't running. |
 
 ## How you receive messages
@@ -40,9 +48,10 @@ tool (`to=<the from>`, `body="..."`, `reply_to=<the id>`). `cn` set this up for 
 the bidirectional path.
 
 **If you were NOT launched with `cn`:** messages still queue durably in your inbox.
-Pull them anytime with `agentnet recv`, and reply with
-`agentnet send <from> "..." --reply-to <id>`. To get them live without `cn`, run the
-**Monitor** tool on `agentnet watch` (each inbound becomes a notification):
+Pull them anytime with `agentnet recv`, and answer with `agentnet reply <id> "..."`
+(auto-routes to the sender + pairs the thread; safer than hand-addressing
+`send <from> ... --reply-to <id>`). To get them live without `cn`, run the **Monitor**
+tool on `agentnet watch` (each inbound becomes a notification):
 
 ```
 Monitor(command="agentnet watch", description="agent-network inbox", persistent=true)
@@ -86,7 +95,9 @@ agentnet ask backend-api "Does the worker pool share the DB connection, or open 
 `ask` sends the question, and if the target isn't online it **wakes** it (spawns a
 headless claude in its directory that reads the question and replies), then blocks
 until the reply lands — or times out (default 180s; it'll still reply to your inbox
-later, get it with `agentnet recv`). No human in the loop.
+later, get it with `agentnet recv`). No human in the loop. Cross-pool `ask server:bob
+"…?"` routes to the other pool (pushes + wakes on a reachable pool; spools on a
+pull-only one).
 
 ## Waking a dormant agent — and the safety scope
 
@@ -97,7 +108,7 @@ cd <that agent's dir> && claude -p "<bootstrap prompt>" --permission-mode bypass
 ```
 
 The bootstrap prompt tells the woken agent to register, read its inbox, **act as an
-advisor**, and reply via `agentnet send --reply-to`. It is explicitly told **not** to
+advisor**, and reply via `agentnet reply <id>`. It is explicitly told **not** to
 make code changes / commits / deploys / any irreversible or outward-facing action
 unless the message explicitly asks AND its own `CLAUDE.md`/safety rules allow it —
 when unsure, it replies asking for confirmation. A woken agent still loads its own
@@ -106,14 +117,40 @@ project `CLAUDE.md` + memory, so each project's safety rules still bind it.
 `wake` needs to know the target's directory: it reads it from `agents.json` (set by a
 prior `register`), or you pass `--dir`.
 
+## Coordinating a fleet — status sweeps + a decisions ledger
+
+**`fleet-status`** prints a **read-only** dashboard: every agent's online/offline
+state, last-seen age, and its most recent line on the bus (a proxy for "what it's
+doing"). Sends nothing, consumes nothing — run it any time. `fleet-status --all` also
+lists agents idle >7d.
+
+To make agents report **fresh** status, broadcast a sweep and read the replies from
+your watch:
+
+```
+agentnet send all "[status sweep] one line: STATUS: IN-FLIGHT <x> | BLOCKED <y> | IDLE" --kind ask
+```
+
+Broadcast never wakes offline agents (cheap) — online ones answer. Convention: reply
+via `agentnet reply <sweep-id> "STATUS: IN-FLIGHT … | BLOCKED … | IDLE"` so it routes
+home + threads.
+
+**`DECISIONS.md`** is an append-only ledger (newest on top) for durable decisions that
+affect multiple agents — a shape call, a rename, a removed param, a policy. Write it
+**once** there instead of relaying it 1:1 to each agent; agents read it at session
+start. Not for routine status (that's the sweep above). Ships as `DECISIONS.md.example`;
+the installer seeds an empty ledger if you don't already have one.
+
 ## Layout
 
 ```
 ~/.claude/agent-network/
   agentnet            # the CLI (python3, stdlib only)
+  fleet-status        # read-only manager dashboard (roster + last-seen + last message)
   README.md           # this protocol doc
+  DECISIONS.md        # append-only cross-agent decisions ledger
   agents.json         # registry: {name: {dir, last_seen, last_woke}}
-  dir_names.json      # cwd -> chosen name overrides
+  dir_names.json      # cwd -> chosen name overrides (an agent's ROOT; subdirs inherit)
   inbox/<name>/       # a message queue per agent (consumed msgs move to .read/)
   log.jsonl           # append-only audit of every message
   woke_<name>.log     # stdout of headless agents woken in <name>'s dir
@@ -140,7 +177,8 @@ so keep it out of version control.
   `agentnet` over SSH — it stamps the sender as `<your-pool>:<you>` and auto-wakes the
   target there. **Pull-only remote** (no `ssh`, e.g. behind NAT): can't be pushed to or
   woken — messages are **spooled** locally and that pool **pulls** them on its next
-  `recv`/`watch`. So `recv`/`watch` also drain any messages other pools spooled for you.
+  `recv`/`watch`. Sending to one prints a loud ⚠️ (spooled, not delivered live). So
+  `recv`/`watch`/`ask` also drain any messages other pools spooled for you.
 - **Trust boundary = SSH.** A pool reaches exactly the pools it has SSH credentials for; no
   tokens, no new network surface. For least privilege, pin a per-remote key in
   `authorized_keys` with `command="agentnet …"`.
@@ -161,10 +199,14 @@ Any future internal verb follows this convention.
 
 - Messages are durable: an offline agent gets them next time it `recv`s or watches.
 - `kind` is freeform (`msg`, `ask`, `reply`, …); `ask`/replies use `--reply-to` to
-  pair up.
+  pair up. **`agentnet reply <id> "..."` sets `--reply-to` + the sender for you** — a
+  reply sent with no `--reply-to` can't be paired in the log.
 - Broadcast (`send all "..."`) reaches every **registered** agent except you.
 - Reply to a message's **`from`** field, never your own name — a self-addressed send
-  lands in your own inbox where the sender never sees it.
+  lands in your own inbox where the sender never sees it (`agentnet reply <id>` does
+  this correctly for you).
+- Sending to a **pull-only / unreachable** remote pool prints a loud ⚠️: the message is
+  spooled, NOT delivered live, and arrives only when that pool next pulls.
 - Keep it advisory across projects; respect each project's `CLAUDE.md`. Any safety
   rule in a project (e.g. "never deploy without approval") binds any agent you wake
   into that repo.

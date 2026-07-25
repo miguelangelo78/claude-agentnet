@@ -32,11 +32,15 @@ echo "→ installing into $NET_DIR and $BIN_DIR ..."
 mkdir -p "$NET_DIR" "$BIN_DIR" "$(dirname "$SETTINGS")"
 
 cp "$SRC/bin/agentnet"                "$NET_DIR/agentnet"
+cp "$SRC/bin/fleet-status"            "$NET_DIR/fleet-status"
 cp "$SRC/bin/cn"                      "$NET_DIR/cn"
 cp "$SRC/bin/agentnet-channel"        "$NET_DIR/agentnet-channel"
 cp "$SRC/hooks/session-start-hook.sh" "$NET_DIR/session-start-hook.sh"
 cp "$SRC/PROTOCOL.md"                 "$NET_DIR/README.md"
-chmod +x "$NET_DIR/agentnet" "$NET_DIR/cn" "$NET_DIR/agentnet-channel" "$NET_DIR/session-start-hook.sh"
+chmod +x "$NET_DIR/agentnet" "$NET_DIR/fleet-status" "$NET_DIR/cn" "$NET_DIR/agentnet-channel" "$NET_DIR/session-start-hook.sh"
+
+# Seed an empty decisions ledger (never clobber an existing one — it accumulates real content).
+[ -f "$NET_DIR/DECISIONS.md" ] || cp "$SRC/DECISIONS.md.example" "$NET_DIR/DECISIONS.md"
 
 ln -sf "$NET_DIR/agentnet" "$BIN_DIR/agentnet"
 ln -sf "$NET_DIR/cn"       "$BIN_DIR/cn"
