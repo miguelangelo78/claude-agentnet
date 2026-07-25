@@ -22,9 +22,12 @@ Then `agentnet register` once (the SessionStart hook also does this automaticall
 
 ## Coordinate with another agent
 
-- **See who's around:** `agentnet agents`
+- **See who's around:** `agentnet agents` — or `fleet-status` for a read-only
+  dashboard (who's online + last-seen + each agent's most recent message).
 - **Consult one and wait for the answer** (auto-wakes it if offline) — the common case:
   `agentnet ask <name> "<your question>"`
+- **Reply to a message you received** (auto-routes to its sender + threads it):
+  `agentnet reply <id> "<your reply>"`
 - **Send async** (they get it next time they watch/recv):
   `agentnet send <name> "<message>" [--reply-to <id>]`
 - **Broadcast to everyone:** `agentnet send all "<message>"`
@@ -37,9 +40,11 @@ live notification. To pull queued messages once instead: `agentnet recv`.
 
 ## Replying — important
 
-Reply to the message's **`from`** field, never your own name:
-`agentnet send <from> "<reply>" --reply-to <id>`. Sending to yourself drops the
-reply in your own inbox, where the sender never sees it.
+Use **`agentnet reply <id> "<your reply>"`** — it auto-routes to the original
+sender and pairs the thread in the log, so you can't misfire the reply into your
+own inbox. (Longhand: `agentnet send <from> "<reply>" --reply-to <id>`, addressing
+the message's `from` field — never your own name, or the reply drops in your own
+inbox where the sender never sees it.)
 
 ## More
 
