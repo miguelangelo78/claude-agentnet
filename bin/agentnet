@@ -339,6 +339,8 @@ def cmd_remote_self(a):
 
 def cmd_send(a):
     me = whoami(); heartbeat(me)
+    if getattr(a, "delegate", False):
+        a.body = _delegate_header(a.body, me)   # travels with the msg to live OR woken recipients
     cfg = load_remotes()
     broadcast = a.to in ("all", "*", "everyone")
     if not broadcast:
@@ -383,8 +385,9 @@ def cmd_send(a):
         print(f"  ↳ '{t}' is offline with no known dir — message QUEUED but not delivered live. "
               f"`agentnet wake {t} --dir <dir>` (or have it register once) to deliver.", file=sys.stderr)
         return
-    _wake(t, d, None, quiet=True)
-    print(f"  ↳ '{t}' was offline — woke it (a SINGLE headless worker drains ALL queued messages; concurrent/repeat wakes coalesce into it, never duplicate instances).", file=sys.stderr)
+    _wake(t, d, None, quiet=True, delegate=getattr(a, "delegate", False))
+    _dmode = " (DELEGATE: resumed-context executor, may build/test/commit, never deploy)" if getattr(a, "delegate", False) else ""
+    print(f"  ↳ '{t}' was offline — woke it{_dmode} (a SINGLE headless worker drains ALL queued messages; concurrent/repeat wakes coalesce into it, never duplicate instances).", file=sys.stderr)
 
 def _find_msg_by_id(name, mid):
     """Locate a message in <name>'s inbox or .read by full id OR 8-char prefix
@@ -558,6 +561,34 @@ def cmd_ask(a):
         time.sleep(1)
     print(f"\n(timeout — no reply from {target} within {a.timeout}s; it may still reply later — `agentnet recv`)")
 
+def _delegate_header(body, by):
+    """Prefix a --delegate message so ANY recipient (live or woken) sees it is a task to
+    EXECUTE, with the commit-yes / deploy-no guardrail travelling with the message."""
+    return (
+        "[DELEGATED TASK] (not an advisory consult) -- you are asked to EXECUTE this, not just advise. "
+        "Within your own CLAUDE.md + safety rules you MAY build, run tests, and COMMIT. You must NEVER "
+        "deploy, restart production services, publish packages, or take any outward-facing / irreversible "
+        "action -- build + test + commit only, then REPLY to " + by + " with the result and let them handle "
+        "the deploy. Complete the whole task in this session before stopping; only stop early if genuinely "
+        "blocked (then reply saying why).\n\nTASK:\n" + body
+    )
+
+def _delegate_prompt(name, me, message):
+    """Wake prompt for a DELEGATED task: execute (build/test/commit) with resumed context,
+    never deploy. Distinct from the default advisory _wake_prompt."""
+    return (
+        f"You have been woken as agent '{name}' with a DELEGATED TASK from '{me}' (via the Claude agent "
+        f"network) -- a task to EXECUTE, not just an advisory reply. FIRST run `agentnet register {name}` "
+        f"then `agentnet recv` to read the delegated message(s). Then DO the work in THIS directory, resuming "
+        f"your own project context: you MAY build, run tests, and COMMIT, strictly within your own CLAUDE.md + "
+        f"safety rules. You must NEVER deploy, restart production services, publish packages, or take any "
+        f"outward-facing / irreversible action -- build + test + commit ONLY, then REPLY to the sender with "
+        f"`agentnet reply <message-id> \"<result>\"` (get the id from `agentnet recv`) and let THEM handle the "
+        f"deploy. Complete the full task in this session before stopping; only stop early if genuinely blocked "
+        f"(then reply why). Protocol: ~/.claude/agent-network/README.md."
+        + (f"\n\nThe delegated task: {message}" if message else "")
+    )
+
 def _wake_prompt(name, me, message, listen):
     return (
         f"You have been woken as part of the Claude agent network (agent name '{name}'). "
@@ -576,7 +607,7 @@ def _wake_prompt(name, me, message, listen):
         + (f"\n\nThe message: {message}" if message else "")
     )
 
-def _wake(name, dir_, message, quiet=False, listen=False):
+def _wake(name, dir_, message, quiet=False, listen=False, delegate=False):
     """Ensure (at most) ONE headless worker is running for `name`.
 
     Previously this spawned `claude -p` directly on every call — so N messages
@@ -596,6 +627,7 @@ def _wake(name, dir_, message, quiet=False, listen=False):
     cmd = [sys.executable, os.path.realpath(__file__), "__wake-worker", name, "--dir", d, "--by", me]
     if message: cmd += ["--message", message]
     if listen: cmd += ["--listen"]
+    if delegate: cmd += ["--delegate"]
     # Detached: the shepherd outlives this CLI call; its claude output -> woke_<name>.log (written inside the shepherd).
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      stdin=subprocess.DEVNULL, start_new_session=True)
@@ -661,10 +693,19 @@ def cmd_wake_worker(a):
     except OSError:
         return  # another worker already owns this agent — it will drain the queue; don't duplicate
     log = os.path.join(ROOT, f"woke_{name}.log")
-    prompt = _wake_prompt(name, a.by or "another agent", a.message, a.listen)
-    # `claude -p ...`; AGENTNET_WAKE_CMD overrides the launched command for tests.
+    delegate = getattr(a, "delegate", False)
+    prompt = (_delegate_prompt(name, a.by or "another agent", a.message) if delegate
+              else _wake_prompt(name, a.by or "another agent", a.message, a.listen))
+    # AGENTNET_WAKE_CMD overrides the launched command for tests. A DELEGATED task runs with
+    # -c (resume the agent's full working context) so it can actually EXECUTE; the default
+    # advisory wake stays a fresh `claude -p` consult (unchanged).
     test_cmd = os.environ.get("AGENTNET_WAKE_CMD")
-    base = test_cmd.split() if test_cmd else ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
+    if test_cmd:
+        base = test_cmd.split()
+    elif delegate:
+        base = ["claude", "-c", "-p", prompt, "--permission-mode", "bypassPermissions"]
+    else:
+        base = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
     if not test_cmd:
         model = os.environ.get("AGENTNET_WAKE_MODEL")  # optional: 'sonnet' for cheaper/faster woken agents
         if model: base += ["--model", model]
@@ -687,7 +728,7 @@ def cmd_wake_worker(a):
 
 def cmd_wake(a):
     _wake(slug(a.name) if a.name else slug(os.path.basename(a.dir or os.getcwd())),
-          a.dir, a.message, listen=a.listen)
+          a.dir, a.message, listen=a.listen, delegate=getattr(a, "delegate", False))
 
 def main():
     ensure_dirs()
@@ -712,6 +753,7 @@ def main():
     sp = sub.add_parser("send"); sp.add_argument("to"); sp.add_argument("body")
     sp.add_argument("--reply-to", dest="reply_to"); sp.add_argument("--kind", default="msg")
     sp.add_argument("--no-wake", dest="no_wake", action="store_true", help="just queue; do NOT auto-wake an offline target")
+    sp.add_argument("--delegate", action="store_true", help="delegate a TASK to EXECUTE (woken agent may build/test/commit within its own CLAUDE.md rules, but NEVER deploy/publish; runs with resumed context) — vs the default advisory consult")
     sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("reply"); sp.add_argument("id"); sp.add_argument("body"); sp.set_defaults(func=cmd_reply)
@@ -726,11 +768,13 @@ def main():
     sp.set_defaults(func=cmd_ask)
 
     sp = sub.add_parser("wake"); sp.add_argument("name", nargs="?"); sp.add_argument("--dir")
-    sp.add_argument("message", nargs="?"); sp.add_argument("--listen", action="store_true"); sp.set_defaults(func=cmd_wake)
+    sp.add_argument("message", nargs="?"); sp.add_argument("--listen", action="store_true")
+    sp.add_argument("--delegate", action="store_true"); sp.set_defaults(func=cmd_wake)
 
     sp = sub.add_parser("__wake-worker")  # internal: single-worker shepherd spawned by _wake (not a user verb)
     sp.add_argument("name"); sp.add_argument("--dir"); sp.add_argument("--by")
     sp.add_argument("--message"); sp.add_argument("--listen", action="store_true")
+    sp.add_argument("--delegate", action="store_true")
     sp.set_defaults(func=cmd_wake_worker)
 
     # internal transport verbs (prefix `__` = not user-facing): the two-phase outbox pull.
