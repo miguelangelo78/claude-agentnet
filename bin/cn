@@ -19,4 +19,11 @@ _claude="$(type -P claude || true)"
 # All other args ("$@") pass straight through to claude.
 SKIP="--dangerously-skip-permissions"
 for arg in "$@"; do [ "$arg" = "$SKIP" ] && SKIP="" && break; done
+# An agent session must be a CHEAPER victim than anything serving customers. Measured on a
+# 31 GB box on 2026-09-24: 76 sessions held 7.6 GB and the kill order was backwards —
+# mother 686, postgres 669, the sessions that caused the pressure 666-668. Raising this is
+# unprivileged and survives the exec below, so the claude process inherits it with no
+# wrapper; LOWERING below 0 needs CAP_SYS_RESOURCE, which is why protecting a service is a
+# root job and this is not. OOM_SCORE_ADJ=0 opts out. A failure here never stops a launch.
+echo "${OOM_SCORE_ADJ:-300}" > /proc/self/oom_score_adj 2>/dev/null || true
 exec "$_claude" --mcp-config "$CHANNEL_CFG" --dangerously-load-development-channels server:agentnet $SKIP "$@"
